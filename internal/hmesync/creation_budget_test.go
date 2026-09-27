@@ -108,17 +108,22 @@ func TestCreationRateLimitPersistsAccountCooldownEvenAfterCancellation(t *testin
 	}
 }
 
-func TestCreationStopsForPausedMailboxBeforeValidation(t *testing.T) {
+func TestAutomaticCreationIgnoresPausedIMAPAuthentication(t *testing.T) {
 	now := testAutoCreateDiagnosticNow()
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true,
 		LastSyncError: "login IMAP account: imap: BAD [AUTHENTICATIONFAILED] Authentication Failed"}, now)
-	client := &fakeAppleClient{validate: func(context.Context, apple.Session) (apple.Session, error) {
-		t.Fatal("paused mailbox reached Apple validation")
-		return apple.Session{}, nil
+	validations := 0
+	client := &fakeAppleClient{validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+		validations++
+		return session, errors.New("validation reached")
 	}}
 	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{
+		AppleID: "primary@icloud.com", Region: apple.RegionGlobal,
+		SessionToken: "fixture", DSID: "42",
+	})
 	_, err := service.CreateAutoAlias(context.Background(), 3)
-	if Code(err) != CodeMailboxAuthenticationPaused || !errors.Is(err, domain.ErrIMAPAuthenticationPaused) {
-		t.Fatalf("paused mailbox error=%v", err)
+	if validations != 1 || errors.Is(err, domain.ErrIMAPAuthenticationPaused) {
+		t.Fatalf("automatic creation validations=%d error=%v; want Apple validation without IMAP pause", validations, err)
 	}
 }
