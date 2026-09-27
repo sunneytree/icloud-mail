@@ -57,16 +57,17 @@ type PoolMember struct {
 }
 
 type PoolLease struct {
-	ID        string    `json:"id"`
-	AliasID   int64     `json:"alias_id"`
-	Address   string    `json:"address"`
-	ClientID  string    `json:"client_id"`
-	Project   string    `json:"project"`
-	RequestID string    `json:"request_id"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID           string    `json:"id"`
+	AliasID      int64     `json:"alias_id"`
+	Address      string    `json:"address"`
+	ClientID     string    `json:"client_id"`
+	Project      string    `json:"project"`
+	RequestID    string    `json:"request_id"`
+	State        string    `json:"state"`
+	ImmediateUse bool      `json:"immediate_use"`
+	CreatedAt    time.Time `json:"created_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type PoolClaim struct {
@@ -75,6 +76,8 @@ type PoolClaim struct {
 	AccountID  int64  `json:"account_id"`
 	GroupID    int64  `json:"group_id"`
 	TTLSeconds int    `json:"ttl_seconds"`
+	// ImmediateUse is server policy, not a caller-controlled request field.
+	ImmediateUse bool `json:"-"`
 }
 
 type PoolPage[T any] struct {
@@ -104,7 +107,8 @@ func (s *Store) migratePool(ctx context.Context, tx *sql.Tx) error {
 		 token_hash TEXT NOT NULL UNIQUE, enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at BIGINT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS pool_accounts (account_id BIGINT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
 		 auto_enroll BOOLEAN NOT NULL DEFAULT FALSE, target INTEGER NOT NULL DEFAULT 0 CHECK(target BETWEEN 0 AND 10000),
-		 enroll_after BIGINT NOT NULL DEFAULT 0)`,
+			 enroll_after BIGINT NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS pool_settings (id INTEGER PRIMARY KEY CHECK(id=1), immediate_used BOOLEAN NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS pool_members (alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
 		 state TEXT NOT NULL CHECK(state IN ('available','leased','used','paused')), updated_at BIGINT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS pool_suspended_members (alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
@@ -128,6 +132,9 @@ func (s *Store) migratePool(ctx context.Context, tx *sql.Tx) error {
 	if err := s.migratePoolLeaseStates(ctx, tx); err != nil {
 		return err
 	}
+	if err := s.migratePoolImmediateUse(ctx, tx); err != nil {
+		return err
+	}
 	if err := s.migratePoolAliasRetirementJobs(ctx, tx); err != nil {
 		return err
 	}
@@ -143,6 +150,60 @@ func (s *Store) migratePool(ctx context.Context, tx *sql.Tx) error {
 		return fmt.Errorf("remove disabled-account pool members: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) migratePoolImmediateUse(ctx context.Context, tx *sql.Tx) error {
+	if s.dialect == dialectPostgres {
+		_, err := s.txExecContext(ctx, tx, `ALTER TABLE pool_leases ADD COLUMN IF NOT EXISTS immediate_use BOOLEAN NOT NULL DEFAULT FALSE`)
+		return err
+	}
+	rows, err := s.txQueryContext(ctx, tx, `PRAGMA table_info(pool_leases)`)
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "immediate_use" {
+			found = true
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil || found {
+		return err
+	}
+	_, err = s.txExecContext(ctx, tx, `ALTER TABLE pool_leases ADD COLUMN immediate_use BOOLEAN NOT NULL DEFAULT FALSE`)
+	return err
+}
+
+// A saved administrator choice overrides the process default; an empty table
+// deliberately leaves ICLOUD_API_POOL_CLAIM_IMMEDIATE_USED in control.
+func (s *Store) PoolImmediateUsed(ctx context.Context, fallback bool) (bool, error) {
+	var enabled bool
+	err := s.queryRowContext(ctx, `SELECT immediate_used FROM pool_settings WHERE id=1`).Scan(&enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fallback, nil
+	}
+	return enabled, err
+}
+
+func (s *Store) SetPoolImmediateUsed(ctx context.Context, enabled bool) error {
+	tx, err := s.poolTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = s.txExecContext(ctx, tx, `INSERT INTO pool_settings(id,immediate_used) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET immediate_used=excluded.immediate_used`, enabled); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) migratePoolLeaseStates(ctx context.Context, tx *sql.Tx) error {
@@ -443,13 +504,13 @@ func (s *Store) ListPoolMembers(ctx context.Context, state, search string, limit
 	return page, rows.Err()
 }
 
-const poolLeaseSelect = `SELECT l.id,COALESCE(l.alias_id,0),l.address,l.client_id,c.project,l.request_id,l.state,l.created_at,l.expires_at,l.updated_at
+const poolLeaseSelect = `SELECT l.id,COALESCE(l.alias_id,0),l.address,l.client_id,c.project,l.request_id,l.state,l.immediate_use,l.created_at,l.expires_at,l.updated_at
  FROM pool_leases l JOIN pool_clients c ON c.id=l.client_id `
 
 func scanPoolLease(row rowScanner) (PoolLease, error) {
 	var v PoolLease
 	var created, expires, updated int64
-	err := row.Scan(&v.ID, &v.AliasID, &v.Address, &v.ClientID, &v.Project, &v.RequestID, &v.State, &created, &expires, &updated)
+	err := row.Scan(&v.ID, &v.AliasID, &v.Address, &v.ClientID, &v.Project, &v.RequestID, &v.State, &v.ImmediateUse, &created, &expires, &updated)
 	v.CreatedAt = time.Unix(0, created).UTC()
 	v.ExpiresAt = time.Unix(0, expires).UTC()
 	v.UpdatedAt = time.Unix(0, updated).UTC()
@@ -557,6 +618,10 @@ func (s *Store) ClaimPool(ctx context.Context, clientID string, input PoolClaim)
 		return nil, ErrPoolEmpty
 	}
 	now := s.now().UTC()
+	leaseState := "leased"
+	if input.ImmediateUse {
+		leaseState = "used"
+	}
 	if _, err = s.txExecContext(ctx, tx, `INSERT INTO pool_requests(client_id,request_id,fingerprint,created_at) VALUES(?,?,?,?)`, clientID, input.RequestID, string(fingerprint), timestamp(now)); err != nil {
 		return nil, err
 	}
@@ -582,10 +647,10 @@ func (s *Store) ClaimPool(ctx context.Context, clientID string, input PoolClaim)
 		if err != nil {
 			return nil, err
 		}
-		if _, err = s.txExecContext(ctx, tx, `INSERT INTO pool_leases(id,alias_id,address,client_id,request_id,state,created_at,expires_at,updated_at) VALUES(?,?,?,?,?,'leased',?,?,?)`, id, v.id, alias.Address, clientID, input.RequestID, timestamp(now), timestamp(now.Add(time.Duration(input.TTLSeconds)*time.Second)), timestamp(now)); err != nil {
+		if _, err = s.txExecContext(ctx, tx, `INSERT INTO pool_leases(id,alias_id,address,client_id,request_id,state,immediate_use,created_at,expires_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, v.id, alias.Address, clientID, input.RequestID, leaseState, input.ImmediateUse, timestamp(now), timestamp(now.Add(time.Duration(input.TTLSeconds)*time.Second)), timestamp(now)); err != nil {
 			return nil, err
 		}
-		if _, err = s.txExecContext(ctx, tx, `UPDATE pool_members SET state='leased',updated_at=? WHERE alias_id=?`, timestamp(now), v.id); err != nil {
+		if _, err = s.txExecContext(ctx, tx, `UPDATE pool_members SET state=?,updated_at=? WHERE alias_id=?`, leaseState, timestamp(now), v.id); err != nil {
 			return nil, err
 		}
 	}
@@ -608,7 +673,7 @@ func (s *Store) rotatePoolAliasTx(ctx context.Context, tx *sql.Tx, alias domain.
 }
 
 func (s *Store) ActPoolLease(ctx context.Context, id, clientID, action string, ttl int) (PoolLease, error) {
-	if action != "commit" && action != "release" && action != "renew" && action != "expire" {
+	if action != "commit" && action != "release" && action != "renew" && action != "expire" && action != "release_used" {
 		return PoolLease{}, ErrPoolInput
 	}
 	if action == "renew" && (ttl < 60 || ttl > 86400) {
@@ -624,18 +689,20 @@ func (s *Store) ActPoolLease(ctx context.Context, id, clientID, action string, t
 		return v, err
 	}
 	now := s.now().UTC()
-	if action == "release" && v.State == "released" || action == "commit" && v.State == "used" || action == "expire" && v.State == "expired" {
+	if (action == "release" || action == "release_used") && v.State == "released" || action == "commit" && v.State == "used" || action == "expire" && v.State == "expired" {
 		return v, nil
 	}
 	if action == "expire" {
 		if v.State != "leased" || now.Before(v.ExpiresAt) {
 			return v, ErrPoolClosed
 		}
+	} else if action == "release_used" && v.State == "used" && v.ImmediateUse {
+		// Explicit release of an immediately-used allocation has no lease deadline.
 	} else if v.State != "leased" || !now.Before(v.ExpiresAt) {
 		return v, ErrPoolClosed
 	}
 	if v.AliasID == 0 {
-		if action != "expire" && action != "release" {
+		if action != "expire" && action != "release" && action != "release_used" {
 			return v, ErrPoolClosed
 		}
 		v.State = "released"
@@ -670,7 +737,7 @@ func (s *Store) ActPoolLease(ctx context.Context, id, clientID, action string, t
 		memberState = "used"
 	case "renew":
 		v.ExpiresAt = now.Add(time.Duration(ttl) * time.Second)
-	case "release", "expire":
+	case "release", "release_used", "expire":
 		if err = s.rotatePoolAliasTx(ctx, tx, alias); err != nil {
 			return v, err
 		}

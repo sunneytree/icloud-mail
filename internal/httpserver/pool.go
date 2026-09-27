@@ -73,6 +73,8 @@ func (s *Server) registerPoolRoutes(api *gin.RouterGroup) {
 
 func (s *Server) registerAdminPoolRoutes(api *gin.RouterGroup) {
 	api.Use(s.poolLock())
+	api.GET("/settings", s.adminPoolSettings)
+	api.PUT("/settings", s.adminSetPoolSettings)
 	api.GET("/accounts", s.adminPoolAccounts)
 	api.PUT("/accounts/:id", s.adminSetPoolAccount)
 	api.GET("/members", s.adminPoolMembers)
@@ -126,7 +128,12 @@ func poolPagination(c *gin.Context) (int, int) {
 }
 
 func (s *Server) poolClaim(c *gin.Context) {
-	input := store.PoolClaim{Count: 1, TTLSeconds: 1800}
+	immediateUse, err := s.store.PoolImmediateUsed(c.Request.Context(), s.cfg.PoolClaimImmediateUsed)
+	if err != nil {
+		s.poolError(c, err)
+		return
+	}
+	input := store.PoolClaim{Count: 1, TTLSeconds: 1800, ImmediateUse: immediateUse}
 	if !decodeAdminAPIJSON(c, &input) {
 		return
 	}
@@ -221,7 +228,11 @@ func (s *Server) poolLeaseAction(action string, admin bool) gin.HandlerFunc {
 		if action == "renew" && !decodeAdminAPIJSON(c, &input) {
 			return
 		}
-		v, err := s.store.ActPoolLease(c.Request.Context(), c.Param("leaseID"), clientID, action, input.TTLSeconds)
+		storeAction := action
+		if action == "release" {
+			storeAction = "release_used"
+		}
+		v, err := s.store.ActPoolLease(c.Request.Context(), c.Param("leaseID"), clientID, storeAction, input.TTLSeconds)
 		if err != nil {
 			s.poolError(c, err)
 			return
@@ -229,6 +240,34 @@ func (s *Server) poolLeaseAction(action string, admin bool) gin.HandlerFunc {
 		s.audit(c, nil, actor, "pool_"+action, "pool_lease", v.ID, "success", "")
 		c.JSON(200, gin.H{"data": v})
 	}
+}
+
+func (s *Server) adminPoolSettings(c *gin.Context) {
+	enabled, err := s.store.PoolImmediateUsed(c.Request.Context(), s.cfg.PoolClaimImmediateUsed)
+	if err != nil {
+		s.poolError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"data": gin.H{"immediate_used": enabled}})
+}
+
+func (s *Server) adminSetPoolSettings(c *gin.Context) {
+	var input struct {
+		ImmediateUsed *bool `json:"immediate_used"`
+	}
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	if input.ImmediateUsed == nil {
+		s.poolError(c, store.ErrPoolInput)
+		return
+	}
+	if err := s.store.SetPoolImmediateUsed(c.Request.Context(), *input.ImmediateUsed); err != nil {
+		s.poolError(c, err)
+		return
+	}
+	s.audit(c, nil, "admin", "pool_settings_update", "pool_settings", "1", "success", "")
+	c.JSON(200, gin.H{"data": gin.H{"immediate_used": *input.ImmediateUsed}})
 }
 
 func (s *Server) poolLeaseCode(c *gin.Context) {

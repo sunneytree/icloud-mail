@@ -40,6 +40,7 @@ type Config struct {
 	PollInterval              time.Duration
 	IMAPIdleEnabled           bool
 	MailOnDemandOnly          bool
+	PoolClaimImmediateUsed    bool
 	IMAPFallbackInterval      time.Duration
 	IMAPTimeout               time.Duration
 	SyncTimeout               time.Duration
@@ -113,6 +114,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.MailOnDemandOnly, err = envBool("ICLOUD_API_MAIL_ON_DEMAND_ONLY", true); err != nil {
+		return Config{}, err
+	}
+	if cfg.PoolClaimImmediateUsed, err = envYesNo("ICLOUD_API_POOL_CLAIM_IMMEDIATE_USED", true); err != nil {
 		return Config{}, err
 	}
 	if cfg.IMAPFallbackInterval, err = envDuration("ICLOUD_API_IMAP_FALLBACK_INTERVAL", 15*time.Minute); err != nil {
@@ -221,6 +225,19 @@ func envBool(name string, fallback bool) (bool, error) {
 		return false, fmt.Errorf("%s 不是有效布尔值: %w", name, err)
 	}
 	return parsed, nil
+}
+
+func envYesNo(name string, fallback bool) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "":
+		return fallback, nil
+	case "yes", "true", "1":
+		return true, nil
+	case "no", "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s 应为 yes 或 no", name)
+	}
 }
 
 func envDuration(name string, fallback time.Duration) (time.Duration, error) {

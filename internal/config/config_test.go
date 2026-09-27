@@ -20,6 +20,7 @@ var configEnvironment = []string{
 	"ICLOUD_API_POLL_INTERVAL",
 	"ICLOUD_API_IMAP_IDLE_ENABLED",
 	"ICLOUD_API_MAIL_ON_DEMAND_ONLY",
+	"ICLOUD_API_POOL_CLAIM_IMMEDIATE_USED",
 	"ICLOUD_API_IMAP_FALLBACK_INTERVAL",
 	"ICLOUD_API_IMAP_TIMEOUT",
 	"ICLOUD_API_SYNC_TIMEOUT",
@@ -435,5 +436,22 @@ func TestTimezoneValidation(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "TZ") {
 		t.Fatalf("无效 TZ 错误 = %v, want 包含 TZ", err)
+	}
+}
+
+func TestPoolClaimImmediateUsedConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil || !cfg.PoolClaimImmediateUsed {
+		t.Fatalf("default = %v, %v", cfg.PoolClaimImmediateUsed, err)
+	}
+	t.Setenv("ICLOUD_API_POOL_CLAIM_IMMEDIATE_USED", "no")
+	cfg, err = Load()
+	if err != nil || cfg.PoolClaimImmediateUsed {
+		t.Fatalf("no = %v, %v", cfg.PoolClaimImmediateUsed, err)
+	}
+	t.Setenv("ICLOUD_API_POOL_CLAIM_IMMEDIATE_USED", "invalid")
+	if _, err = Load(); err == nil {
+		t.Fatal("invalid value accepted")
 	}
 }

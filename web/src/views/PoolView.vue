@@ -155,7 +155,7 @@
                 ><div>{{ date(row.created_at) }}</div>
                 <small>{{
                   row.state === "used"
-                    ? "已确认使用，保留分配"
+                    ? (row.immediate_use ? "领取即已使用，保留分配" : "已确认使用，保留分配")
                     : date(row.expires_at)
                 }}</small></template
               ></el-table-column
@@ -177,7 +177,7 @@
                   >确认使用</el-button
                 >
                 <el-button
-                  v-if="row.state === 'leased'"
+                  v-if="row.state === 'leased' || (row.state === 'used' && row.immediate_use)"
                   link
                   type="danger"
                   :disabled="busy"
@@ -257,6 +257,19 @@
         </el-tab-pane>
 
         <el-tab-pane label="库存与定时创建" name="accounts">
+          <div class="pool-toolbar">
+            <span>领取即标记已使用</span>
+            <el-switch
+              :model-value="immediateUsed"
+              :disabled="busy || loading"
+              active-text="开启"
+              inactive-text="关闭"
+              @change="saveImmediateUsed"
+            />
+          </div>
+          <p class="pool-hint">
+            开启后，项目调用 claim 会立即得到 used 状态，不会因领取期限到期自动回池；确定未使用时调用 release 主动释放，并轮换邮箱凭据。关闭后，按原有 leased → commit / release 流程。切换只影响新领取，已有记录保留原模式。
+          </p>
           <p class="pool-hint">
             开启自动入池后，新创建或新同步的邮箱会进入库存；已有邮箱在「邮箱库存」中手动选择加入。空闲目标为
             0
@@ -342,19 +355,15 @@
               同一邮箱共用取件限流，429 时按 Retry-After 重试。可以追加
               after=RFC3339 时间，只查询更晚的邮件。
             </p>
-            <h3>3. 确认、释放或续期</h3>
+            <h3>3. 释放或确认使用</h3>
             <pre>
 POST /api/v1/pool/leases/LEASE_ID/commit
 POST /api/v1/pool/leases/LEASE_ID/release
 POST /api/v1/pool/leases/LEASE_ID/renew
 续期 JSON: {"ttl_seconds":1800}</pre
             >
-            <p>
-              默认领取 30 分钟，支持 60–86400 秒。成功后 commit
-              保留分配；release
-              或到期回收会轮换邮箱整套凭据。已确认使用的邮箱保持占用。所有请求均带项目
-              Bearer Key。
-            </p>
+            <p v-if="immediateUsed">当前已开启领取即已使用：claim 立即占用，不会到期回池；确定未使用时调用 release，释放时轮换邮箱整套凭据。commit 对已使用记录是幂等操作。所有请求均带项目 Bearer Key。</p>
+            <p v-else>当前为租用模式：默认领取 30 分钟，支持 60–86400 秒；commit 保留分配，release 或到期回收会轮换邮箱整套凭据。所有请求均带项目 Bearer Key。</p>
             <h3>4. 单邮箱 API、IMAPS 和 OAuth</h3>
             <pre>
 GET /api/v1/otp
@@ -496,6 +505,7 @@ const members = ref({ items: [], total: 0 }),
   leases = ref({ items: [], total: 0 }),
   clients = ref([]),
   accounts = ref([]);
+const immediateUsed = ref(true);
 const memberState = ref(""),
   leaseState = ref(""),
   search = ref(""),
@@ -635,6 +645,9 @@ async function refresh() {
   error.value = null;
   try {
     await Promise.all([
+      request("/pool/settings", "GET", undefined, controller.signal).then((result) => {
+        if (ticket === poolRefreshTicket) immediateUsed.value = result.immediate_used;
+      }),
       request("/pool/clients", "GET", undefined, controller.signal).then((result) => {
         if (ticket === poolRefreshTicket) clients.value = result;
       }),
@@ -724,6 +737,17 @@ async function saveAccount(row) {
       target: row.target,
     });
     ElMessage.success("库存设置已保存");
+  });
+}
+async function saveImmediateUsed(enabled) {
+  await mutate(async () => {
+    await ElMessageBox.confirm(
+      enabled ? "新领取将立即标记为已使用，只有主动 release 才会回池。" : "新领取将改为有期限的 leased，需 commit 才会长期占用。",
+      "切换领取模式",
+      { type: "warning" },
+    );
+    await request("/pool/settings", "PUT", { immediate_used: enabled });
+    ElMessage.success("领取模式已保存");
   });
 }
 async function toggleAutoCreate(row, enabled) {
