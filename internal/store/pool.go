@@ -763,7 +763,8 @@ func (s *Store) ActPoolLease(ctx context.Context, id, clientID, action string, t
 	return v, tx.Commit()
 }
 
-// RefreshPool adds only addresses created after opting an account into the pool.
+// RefreshPool optionally adds newly discovered directory addresses after an
+// account opts in. Apple aliases created by this service enroll at confirmation.
 // Existing addresses are enrolled explicitly so previously used mail stays out.
 func (s *Store) RefreshPool(ctx context.Context) error {
 	tx, err := s.poolTx(ctx)
@@ -821,12 +822,12 @@ func (s *Store) PoolCreationAllowed(ctx context.Context, accountID int64) (bool,
 	if err != nil {
 		return false, err
 	}
-	if !auto || target == 0 {
+	if target == 0 {
 		return true, nil
 	}
 	var count int
 	err = s.queryRowContext(ctx, `SELECT COUNT(*) FROM aliases al LEFT JOIN pool_members m ON m.alias_id=al.id
 	 WHERE al.account_id=? AND al.enabled=TRUE AND al.credential_mode='v2' AND al.credential_version>0
-	 AND (m.state='available' OR (m.alias_id IS NULL AND al.id>?))`, accountID, after).Scan(&count)
+	 AND (m.state='available' OR (?=TRUE AND m.alias_id IS NULL AND al.id>?))`, accountID, auto, after).Scan(&count)
 	return count < target, err
 }

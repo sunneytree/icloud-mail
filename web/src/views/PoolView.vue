@@ -59,7 +59,7 @@
           <el-table
             :data="members.items"
             v-loading="loading"
-            empty-text="暂无库存。添加主号后，可加入已有邮箱或开启新邮箱自动入池。"
+            empty-text="暂无库存。新创建且确认成功的邮箱会自动入池；已有邮箱可手动加入。"
           >
             <el-table-column prop="address" label="邮箱" min-width="245" />
             <el-table-column prop="group_name" label="分组" min-width="110" />
@@ -271,7 +271,7 @@
             开启后，项目调用 claim 会立即得到 used 状态，不会因领取期限到期自动回池；确定未使用时调用 release 主动释放，并轮换邮箱凭据。关闭后，按原有 leased → commit / release 流程。切换只影响新领取，已有记录保留原模式。
           </p>
           <p class="pool-hint">
-            开启自动入池后，新创建或新同步的邮箱会进入库存；已有邮箱在「邮箱库存」中手动选择加入。空闲目标为
+            本系统新创建并确认成功、凭据完整的匿名邮箱会直接进入库存，无需开启开关。下方开关仅用于将以后目录同步发现的新地址自动入池；已有邮箱在「邮箱库存」中手动选择加入。空闲目标为
             0
             时按计划创建；达到正数目标时跳过创建，领取后自动恢复。手动批量创建和单次探测均不使用本地创建额度，成功后不额外等待；仍受 Apple 实际响应影响。自动计划每主号滚动 1 小时最多 23 次：Apple Account 新通道 19 次、iCloud Web 旧通道 4 次，至少间隔 2 分钟并错峰执行。仅在明确限流且未产生地址时切换通道；结果不确定、含 HME 或目录确认中的尝试不会自动补造。明确限流默认暂停对应通道 1 小时，更长 Retry-After 以 Apple 为准。本地上限不代表 Apple 官方配额保证。
           </p>
@@ -290,7 +290,7 @@
                 ></template
               ></el-table-column
             >
-            <el-table-column label="新邮箱入池" width="120"
+            <el-table-column label="同步新地址入池" width="150"
               ><template #default="{ row }"
                 ><el-switch v-model="row.auto_enroll" /></template
             ></el-table-column>

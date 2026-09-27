@@ -242,6 +242,25 @@ func TestPoolExpiryAndInventoryGate(t *testing.T) {
 	}
 }
 
+func TestPoolTargetWithoutDirectoryAutoEnroll(t *testing.T) {
+	db, _, account, _, client := poolFixture(t, 1, "")
+	ctx := context.Background()
+	if err := db.SetPoolAccount(ctx, account.ID, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := db.PoolCreationAllowed(ctx, account.ID)
+	if err != nil || allowed {
+		t.Fatalf("stock target ignored with directory auto-enroll off: allowed=%v err=%v", allowed, err)
+	}
+	if _, err := db.ClaimPool(ctx, client.ID, store.PoolClaim{RequestID: "target-no-auto-enroll", Count: 1, TTLSeconds: 600}); err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = db.PoolCreationAllowed(ctx, account.ID)
+	if err != nil || !allowed {
+		t.Fatalf("creation did not resume after claim: allowed=%v err=%v", allowed, err)
+	}
+}
+
 func TestPoolNewOnlyEnrollmentAndPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "persistent.db")
 	db, _, account, _, client := poolFixture(t, 0, path)

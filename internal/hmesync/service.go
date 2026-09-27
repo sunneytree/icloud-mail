@@ -685,9 +685,6 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 	if !account.Enabled {
 		return domain.Alias{}, wrapError(CodeAccountDisabled, ErrAccountDisabled, nil)
 	}
-	if domain.IsIMAPAuthenticationFailure(account.LastSyncError) {
-		return domain.Alias{}, wrapError(CodeMailboxAuthenticationPaused, domain.ErrIMAPAuthenticationPaused, nil)
-	}
 	reportProgress(domain.AliasCreationPhaseCheckingCapacity, autoCreateCheckingCapacityPercent, 0)
 	pendingConfirmation, pendingErr := getPending(ctx, accountID)
 	hasPendingConfirmation := pendingErr == nil
