@@ -41,20 +41,21 @@ type Session struct {
 }
 
 type Account struct {
-	ID                 int64
-	Name               string
-	Email              string
-	IMAPHost           string
-	IMAPPort           int
-	IMAPUsername       string
-	PasswordCiphertext string
-	Enabled            bool
-	LastSyncStatus     string
-	LastSyncError      string
-	LastSyncedAt       *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	AliasCount         int
+	ID                     int64
+	VerifyForwardingTarget bool
+	Name                   string
+	Email                  string
+	IMAPHost               string
+	IMAPPort               int
+	IMAPUsername           string
+	PasswordCiphertext     string
+	Enabled                bool
+	LastSyncStatus         string
+	LastSyncError          string
+	LastSyncedAt           *time.Time
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+	AliasCount             int
 	// MailboxType is the account's mailbox integration mode. Empty values on
 	// in-memory legacy records are treated as MailboxTypeICloud by stores and
 	// API boundaries.

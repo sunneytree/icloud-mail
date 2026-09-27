@@ -61,6 +61,7 @@
             v-loading="loading"
             empty-text="暂无库存。新创建且确认成功的邮箱会自动入池；已有邮箱可手动加入。"
           >
+            <el-table-column label="序号" width="64" align="center"><template #default="{ $index }">{{ (memberPage - 1) * 50 + $index + 1 }}</template></el-table-column>
             <el-table-column prop="address" label="邮箱" min-width="245" />
             <el-table-column prop="group_name" label="分组" min-width="110" />
             <el-table-column label="状态" width="135"
@@ -141,6 +142,7 @@
             v-loading="loading"
             empty-text="项目通过 API 领取邮箱后，记录会显示在这里。"
           >
+            <el-table-column label="序号" width="64" align="center"><template #default="{ $index }">{{ (leasePage - 1) * 50 + $index + 1 }}</template></el-table-column>
             <el-table-column prop="address" label="邮箱" min-width="230" />
             <el-table-column prop="project" label="项目" min-width="110" />
             <el-table-column label="状态" width="100"

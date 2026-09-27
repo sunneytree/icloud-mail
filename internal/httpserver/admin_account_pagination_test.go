@@ -37,15 +37,15 @@ func TestAdminAPIAccountDetailPaginatesAliasesAndSyncDefaultsAreBounded(t *testi
 	defaultResponse := env.request(t, http.MethodGet, path, nil, "", []*http.Cookie{cookie}, "")
 	defaultPayload := decodeAdminAPIAccountDetailTestEnvelope(t, defaultResponse)
 	assertAdminAPIAccountAliasPage(t, defaultPayload, 20, 20, 0, 27, true, 27)
-	if got := defaultPayload.Data.Aliases[0].Address; got != "detail-000@icloud.com" {
-		t.Fatalf("default first alias = %q, want detail-000@icloud.com", got)
+	if got := defaultPayload.Data.Aliases[0].Address; got != "detail-026@icloud.com" {
+		t.Fatalf("default first alias = %q, want detail-026@icloud.com", got)
 	}
 
 	pageResponse := env.request(t, http.MethodGet, path+"?limit=5&offset=20", nil, "", []*http.Cookie{cookie}, "")
 	pagePayload := decodeAdminAPIAccountDetailTestEnvelope(t, pageResponse)
 	assertAdminAPIAccountAliasPage(t, pagePayload, 5, 5, 20, 27, true, 27)
-	if got := pagePayload.Data.Aliases[0].Address; got != "detail-020@icloud.com" {
-		t.Fatalf("offset page first alias = %q, want detail-020@icloud.com", got)
+	if got := pagePayload.Data.Aliases[0].Address; got != "detail-006@icloud.com" {
+		t.Fatalf("offset page first alias = %q, want detail-006@icloud.com", got)
 	}
 
 	lastResponse := env.request(t, http.MethodGet, path+"?limit=5&offset=25", nil, "", []*http.Cookie{cookie}, "")
@@ -83,7 +83,7 @@ func TestAdminAPIAccountDetailUsesAliasListPaginationValidation(t *testing.T) {
 	}
 }
 
-func TestAdminAPIAppleSyncKeepsCreatedCredentialsOutsideBoundedAliasPage(t *testing.T) {
+func TestAdminAPIAppleSyncKeepsCreatedCredentialsAndNewestAliasInBoundedPage(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	cookie, csrf, _ := env.createSession(t, "apple-page-admin", "unused-password")
 	account := adminAPITestCreateAccount(t, env, "apple-page@icloud.com")
@@ -141,10 +141,8 @@ func TestAdminAPIAppleSyncKeepsCreatedCredentialsOutsideBoundedAliasPage(t *test
 		payload.Data.Created[0].Alias.APIKey == "" {
 		t.Fatalf("Apple sync created credential envelope = %#v", payload.Data.Created)
 	}
-	for _, alias := range payload.Data.Aliases {
-		if alias.ID == createdID {
-			t.Fatalf("page-outside created alias %d was appended to bounded aliases", createdID)
-		}
+	if payload.Data.Aliases[0].ID != createdID {
+		t.Fatalf("newest created alias %d was not first in bounded page", createdID)
 	}
 }
 

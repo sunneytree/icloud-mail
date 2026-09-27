@@ -143,6 +143,9 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 	if err := migrateMailTransport(ctx, tx); err != nil {
 		return err
 	}
+	if err := s.migrateAccountForwardingPolicy(ctx, tx); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration: %w", err)
 	}
@@ -261,6 +264,9 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 		return err
 	}
 	if err := migrateMailTransport(ctx, tx); err != nil {
+		return err
+	}
+	if err := s.migrateAccountForwardingPolicy(ctx, tx); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

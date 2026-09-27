@@ -31,6 +31,7 @@ const aliasJoins = `
 	LEFT JOIN mail_groups mg ON mg.id = al.group_id`
 
 type AliasListFilter struct {
+	NewestFirst         bool
 	AccountID           *int64
 	OnlyEnabledAccounts bool
 	Enabled             *bool
@@ -278,8 +279,12 @@ func (s *Store) ListAliasesPage(ctx context.Context, filter AliasListFilter) (Al
 		return AliasPage{}, fmt.Errorf("count aliases page: %w", err)
 	}
 
+	order := `al.address, al.id`
+	if filter.NewestFirst {
+		order = `al.id DESC`
+	}
 	query := `SELECT ` + aliasColumns + aliasJoins + predicate +
-		` ORDER BY al.address, al.id LIMIT ? OFFSET ?`
+		` ORDER BY ` + order + ` LIMIT ? OFFSET ?`
 	args := append(append([]any{}, filterArgs...), filter.Limit, filter.Offset)
 	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
