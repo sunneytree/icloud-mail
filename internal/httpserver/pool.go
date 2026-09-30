@@ -192,7 +192,7 @@ func (s *Server) poolLeasePayload(c *gin.Context, lease store.PoolLease) (gin.H,
 
 func (s *Server) poolListLeases(c *gin.Context) {
 	limit, offset := poolPagination(c)
-	page, err := s.store.ListPoolLeases(c.Request.Context(), poolClient(c).ID, c.Query("state"), limit, offset)
+	page, err := s.store.ListPoolLeases(c.Request.Context(), poolClient(c).ID, c.Query("state"), limit, offset, c.Query("purpose"))
 	if err != nil {
 		s.poolError(c, err)
 		return
@@ -484,7 +484,7 @@ func (s *Server) adminSetPoolAccount(c *gin.Context) {
 
 func (s *Server) adminPoolMembers(c *gin.Context) {
 	limit, offset := poolPagination(c)
-	page, err := s.store.ListPoolMembers(c.Request.Context(), c.Query("state"), c.Query("q"), limit, offset)
+	page, err := s.store.ListPoolMembers(c.Request.Context(), c.Query("state"), c.Query("q"), limit, offset, c.Query("purpose"))
 	if err != nil {
 		s.poolError(c, err)
 		return
@@ -493,7 +493,7 @@ func (s *Server) adminPoolMembers(c *gin.Context) {
 }
 func (s *Server) adminPoolLeases(c *gin.Context) {
 	limit, offset := poolPagination(c)
-	page, err := s.store.ListPoolLeases(c.Request.Context(), c.Query("client_id"), c.Query("state"), limit, offset)
+	page, err := s.store.ListPoolLeases(c.Request.Context(), c.Query("client_id"), c.Query("state"), limit, offset, c.Query("purpose"))
 	if err != nil {
 		s.poolError(c, err)
 		return

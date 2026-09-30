@@ -188,7 +188,7 @@ func (s *Store) PoolAliasRetirementAccounts(ctx context.Context, clientID string
 			return nil, ErrPoolRetirementNotUsed
 		}
 		var live int
-		if err := s.queryRowContext(ctx, `SELECT COUNT(*) FROM pool_leases WHERE alias_id=? AND state IN ('leased','used','retiring')`, item.AliasID).Scan(&live); err != nil {
+		if err := s.queryRowContext(ctx, `SELECT COUNT(*) FROM (SELECT alias_id FROM pool_leases WHERE state IN ('leased','used','retiring') UNION ALL SELECT alias_id FROM pool_legacy_purpose_marks) live WHERE alias_id=?`, item.AliasID).Scan(&live); err != nil {
 			return nil, err
 		}
 		if live != 1 {
@@ -295,7 +295,7 @@ func (s *Store) StartPoolAliasRetirement(ctx context.Context, clientID, operatio
 			return PoolAliasRetirementJob{}, false, ErrPoolRetirementNotUsed
 		}
 		var live int
-		if err := s.txQueryRowContext(ctx, tx, `SELECT COUNT(*) FROM pool_leases WHERE alias_id=? AND state IN ('leased','used','retiring')`, input.AliasID).Scan(&live); err != nil {
+		if err := s.txQueryRowContext(ctx, tx, `SELECT COUNT(*) FROM (SELECT alias_id FROM pool_leases WHERE state IN ('leased','used','retiring') UNION ALL SELECT alias_id FROM pool_legacy_purpose_marks) live WHERE alias_id=?`, input.AliasID).Scan(&live); err != nil {
 			return PoolAliasRetirementJob{}, false, err
 		}
 		if live != 1 {

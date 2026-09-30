@@ -47,6 +47,7 @@ type PoolAccount struct {
 }
 
 type PoolMember struct {
+	Purpose   string    `json:"purpose"`
 	AliasID   int64     `json:"alias_id"`
 	AccountID int64     `json:"account_id"`
 	Address   string    `json:"address"`
@@ -57,6 +58,7 @@ type PoolMember struct {
 }
 
 type PoolLease struct {
+	Purpose      string    `json:"purpose"`
 	ID           string    `json:"id"`
 	AliasID      int64     `json:"alias_id"`
 	Address      string    `json:"address"`
@@ -71,6 +73,7 @@ type PoolLease struct {
 }
 
 type PoolClaim struct {
+	Purpose    string `json:"purpose"`
 	RequestID  string `json:"request_id"`
 	Count      int    `json:"count"`
 	AccountID  int64  `json:"account_id"`
@@ -121,7 +124,6 @@ func (s *Store) migratePool(ctx context.Context, tx *sql.Tx) error {
 		 state TEXT NOT NULL CHECK(state IN ('leased','used','retiring','retired','released','expired')),
 		 created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
 		 FOREIGN KEY(client_id,request_id) REFERENCES pool_requests(client_id,request_id))`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS pool_one_live_lease ON pool_leases(alias_id) WHERE state IN ('leased','used','retiring')`,
 		`CREATE INDEX IF NOT EXISTS pool_lease_expiry ON pool_leases(state, expires_at)`,
 		`CREATE INDEX IF NOT EXISTS pool_lease_request ON pool_leases(client_id, request_id)`,
 	} {
@@ -133,6 +135,9 @@ func (s *Store) migratePool(ctx context.Context, tx *sql.Tx) error {
 		return err
 	}
 	if err := s.migratePoolImmediateUse(ctx, tx); err != nil {
+		return err
+	}
+	if err := s.migratePoolPurpose(ctx, tx); err != nil {
 		return err
 	}
 	if err := s.migratePoolAliasRetirementJobs(ctx, tx); err != nil {
@@ -227,7 +232,6 @@ func (s *Store) migratePoolLeaseStates(ctx context.Context, tx *sql.Tx) error {
 					SELECT id,alias_id,address,client_id,request_id,state,created_at,expires_at,updated_at FROM pool_leases`,
 				`DROP TABLE pool_leases`,
 				`ALTER TABLE pool_leases_next RENAME TO pool_leases`,
-				`CREATE UNIQUE INDEX pool_one_live_lease ON pool_leases(alias_id) WHERE state IN ('leased','used','retiring')`,
 				`CREATE INDEX pool_lease_expiry ON pool_leases(state, expires_at)`,
 				`CREATE INDEX pool_lease_request ON pool_leases(client_id, request_id)`,
 			} {
@@ -255,7 +259,6 @@ func (s *Store) migratePoolLeaseStates(ctx context.Context, tx *sql.Tx) error {
 		`ALTER TABLE pool_leases DROP CONSTRAINT IF EXISTS pool_leases_state_check`,
 		`ALTER TABLE pool_leases ADD CONSTRAINT pool_leases_state_check CHECK(state IN ('leased','used','retiring','retired','released','expired'))`,
 		`DROP INDEX IF EXISTS pool_one_live_lease`,
-		`CREATE UNIQUE INDEX pool_one_live_lease ON pool_leases(alias_id) WHERE state IN ('leased','used','retiring')`,
 	} {
 		if _, err := s.txExecContext(ctx, tx, query); err != nil {
 			return fmt.Errorf("upgrade PostgreSQL pool lease states: %w", err)
@@ -465,7 +468,7 @@ func (s *Store) SetPoolMember(ctx context.Context, id int64, state string) error
 		return err
 	}
 	defer tx.Rollback()
-	result, err := s.txExecContext(ctx, tx, `UPDATE pool_members SET state=?,updated_at=? WHERE alias_id=? AND state IN ('available','paused')`, state, timestamp(s.now()), id)
+	result, err := s.txExecContext(ctx, tx, `UPDATE pool_members SET state=?,updated_at=? WHERE alias_id=?`, state, timestamp(s.now()), id)
 	if err != nil {
 		return err
 	}
@@ -476,24 +479,38 @@ func (s *Store) SetPoolMember(ctx context.Context, id int64, state string) error
 	if n != 1 {
 		return ErrPoolConflict
 	}
+	if err = s.refreshPoolMemberSummaryTx(ctx, tx, id); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
-func (s *Store) ListPoolMembers(ctx context.Context, state, search string, limit, offset int) (PoolPage[PoolMember], error) {
+func (s *Store) ListPoolMembers(ctx context.Context, state, search string, limit, offset int, purposes ...string) (PoolPage[PoolMember], error) {
 	page := PoolPage[PoolMember]{Items: []PoolMember{}}
+	purpose := "common"
+	if len(purposes) > 0 {
+		purpose = purposes[0]
+	}
+	purpose, err := normalizePoolPurpose(purpose)
+	if err != nil {
+		return page, err
+	}
+	effective := `CASE WHEN m.state='paused' THEN 'paused' ELSE COALESCE((SELECT l.state FROM pool_leases l WHERE l.alias_id=m.alias_id AND l.purpose=? AND l.state IN ('used','leased','retiring') LIMIT 1),(SELECT 'used' FROM pool_legacy_purpose_marks u WHERE u.alias_id=m.alias_id AND u.purpose=?),'available') END`
+
 	where := ` FROM pool_members m JOIN aliases al ON al.id=m.alias_id JOIN accounts a ON a.id=al.account_id
-	 LEFT JOIN mail_groups g ON g.id=al.group_id WHERE (?='' OR m.state=?) AND LOWER(al.address) LIKE ?`
-	args := []any{state, state, "%" + strings.ToLower(search) + "%"}
+	 LEFT JOIN mail_groups g ON g.id=al.group_id WHERE (?='' OR ` + effective + `=?) AND LOWER(al.address) LIKE ?`
+	args := []any{state, purpose, purpose, state, "%" + strings.ToLower(search) + "%"}
 	if err := s.queryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&page.Total); err != nil {
 		return page, err
 	}
-	rows, err := s.queryContext(ctx, `SELECT al.id,al.account_id,al.address,COALESCE(g.name,''),m.state,(al.enabled AND a.enabled),m.updated_at`+where+` ORDER BY al.id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
+	rows, err := s.queryContext(ctx, `SELECT al.id,al.account_id,al.address,COALESCE(g.name,''),`+effective+`,(al.enabled AND a.enabled),m.updated_at`+where+` ORDER BY al.id DESC LIMIT ? OFFSET ?`, append(append([]any{purpose, purpose}, args...), limit, offset)...)
 	if err != nil {
 		return page, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var v PoolMember
+		v.Purpose = purpose
 		var at int64
 		if err := rows.Scan(&v.AliasID, &v.AccountID, &v.Address, &v.GroupName, &v.State, &v.Enabled, &at); err != nil {
 			return page, err
@@ -504,23 +521,31 @@ func (s *Store) ListPoolMembers(ctx context.Context, state, search string, limit
 	return page, rows.Err()
 }
 
-const poolLeaseSelect = `SELECT l.id,COALESCE(l.alias_id,0),l.address,l.client_id,c.project,l.request_id,l.state,l.immediate_use,l.created_at,l.expires_at,l.updated_at
+const poolLeaseSelect = `SELECT l.id,COALESCE(l.alias_id,0),l.address,l.client_id,c.project,l.request_id,l.state,l.immediate_use,l.purpose,l.created_at,l.expires_at,l.updated_at
  FROM pool_leases l JOIN pool_clients c ON c.id=l.client_id `
 
 func scanPoolLease(row rowScanner) (PoolLease, error) {
 	var v PoolLease
 	var created, expires, updated int64
-	err := row.Scan(&v.ID, &v.AliasID, &v.Address, &v.ClientID, &v.Project, &v.RequestID, &v.State, &v.ImmediateUse, &created, &expires, &updated)
+	err := row.Scan(&v.ID, &v.AliasID, &v.Address, &v.ClientID, &v.Project, &v.RequestID, &v.State, &v.ImmediateUse, &v.Purpose, &created, &expires, &updated)
 	v.CreatedAt = time.Unix(0, created).UTC()
 	v.ExpiresAt = time.Unix(0, expires).UTC()
 	v.UpdatedAt = time.Unix(0, updated).UTC()
 	return v, err
 }
 
-func (s *Store) ListPoolLeases(ctx context.Context, clientID, state string, limit, offset int) (PoolPage[PoolLease], error) {
+func (s *Store) ListPoolLeases(ctx context.Context, clientID, state string, limit, offset int, purposes ...string) (PoolPage[PoolLease], error) {
 	page := PoolPage[PoolLease]{Items: []PoolLease{}}
 	where := ` WHERE (?='' OR l.client_id=?) AND (?='' OR l.state=?)`
 	args := []any{clientID, clientID, state, state}
+	if len(purposes) > 0 && strings.TrimSpace(purposes[0]) != "" {
+		purpose, err := normalizePoolPurpose(purposes[0])
+		if err != nil {
+			return page, err
+		}
+		where += " AND l.purpose=?"
+		args = append(args, purpose)
+	}
 	if err := s.queryRowContext(ctx, `SELECT COUNT(*) FROM pool_leases l`+where, args...).Scan(&page.Total); err != nil {
 		return page, err
 	}
@@ -561,6 +586,11 @@ func (s *Store) poolRequestLeasesTx(ctx context.Context, tx *sql.Tx, clientID, r
 }
 
 func (s *Store) ClaimPool(ctx context.Context, clientID string, input PoolClaim) ([]PoolLease, error) {
+	var purposeErr error
+	input.Purpose, purposeErr = normalizePoolPurpose(input.Purpose)
+	if purposeErr != nil {
+		return nil, purposeErr
+	}
 	if len(input.RequestID) < 8 || len(input.RequestID) > 128 || input.Count < 1 || input.Count > 50 || input.TTLSeconds < 60 || input.TTLSeconds > 86400 || input.AccountID < 0 || input.GroupID < 0 {
 		return nil, ErrPoolInput
 	}
@@ -585,6 +615,19 @@ func (s *Store) ClaimPool(ctx context.Context, clientID string, input PoolClaim)
 	var previous string
 	err = s.txQueryRowContext(ctx, tx, `SELECT fingerprint FROM pool_requests WHERE client_id=? AND request_id=?`, clientID, input.RequestID).Scan(&previous)
 	if err == nil {
+		var oldInput PoolClaim
+		if json.Unmarshal([]byte(previous), &oldInput) == nil && oldInput.Purpose == "" {
+			oldLeases, e := s.poolRequestLeasesTx(ctx, tx, clientID, input.RequestID)
+			if e != nil {
+				return nil, e
+			}
+			oldInput.Purpose = "common"
+			if len(oldLeases) > 0 {
+				oldInput.Purpose = oldLeases[0].Purpose
+			}
+			normalized, _ := json.Marshal(oldInput)
+			previous = string(normalized)
+		}
 		if previous != string(fingerprint) {
 			return nil, ErrPoolRequestConflict
 		}
@@ -594,8 +637,10 @@ func (s *Store) ClaimPool(ctx context.Context, clientID string, input PoolClaim)
 		return nil, err
 	}
 	rows, err := s.txQueryContext(ctx, tx, `SELECT al.id,al.account_id FROM pool_members m JOIN aliases al ON al.id=m.alias_id JOIN accounts a ON a.id=al.account_id
-	 WHERE m.state='available' AND al.enabled=TRUE AND a.enabled=TRUE AND al.credential_mode='v2' AND al.credential_version>0
-	 AND (?=0 OR a.id=?) AND (?=0 OR al.group_id=?) ORDER BY a.id,al.id LIMIT ?`, input.AccountID, input.AccountID, input.GroupID, input.GroupID, input.Count)
+	 WHERE m.state<>'paused' AND al.enabled=TRUE AND a.enabled=TRUE AND al.credential_mode='v2' AND al.credential_version>0
+     AND NOT EXISTS (SELECT 1 FROM pool_leases l WHERE l.alias_id=al.id AND (l.state='retiring' OR (l.purpose=? AND l.state IN ('leased','used'))))
+     AND NOT EXISTS (SELECT 1 FROM pool_legacy_purpose_marks u WHERE u.alias_id=al.id AND u.purpose=?)
+	 AND (?=0 OR a.id=?) AND (?=0 OR al.group_id=?) ORDER BY a.id,al.id LIMIT ?`, input.Purpose, input.Purpose, input.AccountID, input.AccountID, input.GroupID, input.GroupID, input.Count)
 	if err != nil {
 		return nil, err
 	}
@@ -640,17 +685,17 @@ func (s *Store) ClaimPool(ctx context.Context, clientID string, input PoolClaim)
 		if !enabled || !alias.Enabled || alias.CredentialMode != domain.AliasCredentialModeV2 {
 			return nil, ErrPoolConflict
 		}
-		if err = s.rotatePoolAliasTx(ctx, tx, alias); err != nil {
+		if err = s.rotatePoolAliasUnlessSharedTx(ctx, tx, alias, ""); err != nil {
 			return nil, err
 		}
 		id, err := poolID()
 		if err != nil {
 			return nil, err
 		}
-		if _, err = s.txExecContext(ctx, tx, `INSERT INTO pool_leases(id,alias_id,address,client_id,request_id,state,immediate_use,created_at,expires_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, v.id, alias.Address, clientID, input.RequestID, leaseState, input.ImmediateUse, timestamp(now), timestamp(now.Add(time.Duration(input.TTLSeconds)*time.Second)), timestamp(now)); err != nil {
+		if _, err = s.txExecContext(ctx, tx, `INSERT INTO pool_leases(id,alias_id,address,client_id,request_id,state,immediate_use,purpose,created_at,expires_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, v.id, alias.Address, clientID, input.RequestID, leaseState, input.ImmediateUse, input.Purpose, timestamp(now), timestamp(now.Add(time.Duration(input.TTLSeconds)*time.Second)), timestamp(now)); err != nil {
 			return nil, err
 		}
-		if _, err = s.txExecContext(ctx, tx, `UPDATE pool_members SET state=?,updated_at=? WHERE alias_id=?`, leaseState, timestamp(now), v.id); err != nil {
+		if err = s.refreshPoolMemberSummaryTx(ctx, tx, v.id); err != nil {
 			return nil, err
 		}
 	}
@@ -730,18 +775,15 @@ func (s *Store) ActPoolLease(ctx context.Context, id, clientID, action string, t
 	if err != nil {
 		return v, err
 	}
-	memberState := "leased"
 	switch action {
 	case "commit":
 		v.State = "used"
-		memberState = "used"
 	case "renew":
 		v.ExpiresAt = now.Add(time.Duration(ttl) * time.Second)
 	case "release", "release_used", "expire":
-		if err = s.rotatePoolAliasTx(ctx, tx, alias); err != nil {
+		if err = s.rotatePoolAliasUnlessSharedTx(ctx, tx, alias, v.ID); err != nil {
 			return v, err
 		}
-		memberState = "available"
 		v.State = "released"
 		if action == "expire" {
 			v.State = "expired"
@@ -751,14 +793,8 @@ func (s *Store) ActPoolLease(ctx context.Context, id, clientID, action string, t
 	if _, err = s.txExecContext(ctx, tx, `UPDATE pool_leases SET state=?,expires_at=?,updated_at=? WHERE id=?`, v.State, timestamp(v.ExpiresAt), timestamp(now), v.ID); err != nil {
 		return v, err
 	}
-	if accountEnabled {
-		if _, err = s.txExecContext(ctx, tx, `UPDATE pool_members SET state=?,updated_at=? WHERE alias_id=?`, memberState, timestamp(now), v.AliasID); err != nil {
-			return v, err
-		}
-	} else {
-		if _, err = s.txExecContext(ctx, tx, `UPDATE pool_suspended_members SET state=?,updated_at=? WHERE alias_id=?`, memberState, timestamp(now), v.AliasID); err != nil {
-			return v, err
-		}
+	if err = s.refreshPoolMemberSummaryTx(ctx, tx, v.AliasID); err != nil {
+		return v, err
 	}
 	return v, tx.Commit()
 }

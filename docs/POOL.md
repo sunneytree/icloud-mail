@@ -219,3 +219,16 @@ npm ci
 npm test
 npm run build
 ```
+
+
+## 按用途分配（purpose）
+
+`POST /api/v1/pool/claim` 增加 `purpose`，如 `{"request_id":"adobe-job-0001","count":1,"purpose":"adobe"}`。省略、空字符串或纯空格归为 `common`；去首尾空格、转小写，仅允许 1–64 个 ASCII 字母、数字、下划线、短横线。
+
+Key 负责鉴权；用途在整个邮箱池内隔离使用状态，并不绑定 Key。相同邮箱可分别用于 adobe 和 gpt，同一用途不能重复分配。请求编号仍在同一个 Key 下唯一；重试必须使用原参数（包括 purpose），不同用途应使用不同 request_id。领取响应 lease.purpose 返回归一化后的用途。
+
+release/commit/renew 仍按 lease ID 操作，无需另传 purpose，不会修改其他用途状态。存在其他用途的活动领取时不会轮换共享的邮箱凭据。用途不是收件隔离或权限隔离：同一邮箱收到的邮件仍共用。
+
+启动迁移仅执行一次：旧 used/retiring/retired 领取归到 adobe，其他旧记录归 common；没有领取记录的旧已用库存保留 adobe 使用标记。之后新产生的 common 记录不会在重启时再次迁走。
+
+管理库存 API `GET /admin/api/v1/pool/members?purpose=adobe` 按用途返回状态（默认 common）；领取列表可用 `purpose` 过滤。页面默认 Adobe，支持通用/GPT/自定义用途。暂停/恢复、主号停用、Apple 删除仍为全局；存在多个用途活动领取时禁止按单个领取删除 Apple 邮箱。自动补库存目标按全局无占用地址计算。

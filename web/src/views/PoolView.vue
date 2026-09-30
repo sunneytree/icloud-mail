@@ -21,6 +21,18 @@
         <el-tab-pane label="邮箱库存" name="members">
           <div class="pool-toolbar">
             <el-select
+              v-model="memberPurpose"
+              placeholder="用途：Adobe"
+              filterable
+              allow-create
+              @change="
+                memberPage = 1;
+                loadMembers();
+              "
+            >
+              <el-option v-for="p in purposes" :key="p" :label="purposeName(p)" :value="p" />
+            </el-select>
+            <el-select
               v-model="memberState"
               placeholder="全部状态"
               clearable
@@ -63,6 +75,7 @@
           >
             <el-table-column label="序号" width="64" align="center"><template #default="{ $index }">{{ (memberPage - 1) * 50 + $index + 1 }}</template></el-table-column>
             <el-table-column prop="address" label="邮箱" min-width="245" />
+            <el-table-column label="用途" width="100"><template #default="{ row }">{{ purposeName(row.purpose) }}</template></el-table-column>
             <el-table-column prop="group_name" label="分组" min-width="110" />
             <el-table-column label="状态" width="135"
               ><template #default="{ row }"
@@ -109,6 +122,18 @@
         <el-tab-pane label="领取记录" name="leases">
           <div class="pool-toolbar">
             <el-select
+              v-model="leasePurpose"
+              placeholder="用途：Adobe"
+              filterable
+              allow-create
+              @change="
+                leasePage = 1;
+                loadLeases();
+              "
+            >
+              <el-option v-for="p in purposes" :key="p" :label="purposeName(p)" :value="p" />
+            </el-select>
+            <el-select
               v-model="leaseState"
               placeholder="全部状态"
               clearable
@@ -145,6 +170,7 @@
             <el-table-column label="序号" width="64" align="center"><template #default="{ $index }">{{ (leasePage - 1) * 50 + $index + 1 }}</template></el-table-column>
             <el-table-column prop="address" label="邮箱" min-width="230" />
             <el-table-column prop="project" label="项目" min-width="110" />
+            <el-table-column label="用途" width="100"><template #default="{ row }">{{ purposeName(row.purpose) }}</template></el-table-column>
             <el-table-column label="状态" width="100"
               ><template #default="{ row }"
                 ><el-tag :type="stateType(row.state)">{{
@@ -215,7 +241,7 @@
             >
           </div>
           <p class="pool-hint">
-            每个项目使用独立 Key 领取邮箱，只能读取自己的领取记录。项目 Key
+            Key 用于鉴权，只能读取该 Key 的领取记录；多个项目可共用一把 Key，通过 purpose 区分用途。项目 Key
             仅在创建或轮换时展示。
           </p>
           <el-table
@@ -270,7 +296,9 @@
             />
           </div>
           <p class="pool-hint">
-            开启后，项目调用 claim 会立即得到 used 状态，不会因领取期限到期自动回池；确定未使用时调用 release 主动释放，并轮换邮箱凭据。关闭后，按原有 leased → commit / release 流程。切换只影响新领取，已有记录保留原模式。
+            开启后，项目调用 claim 会立即得到 used 状态，不会因领取期限到期自动回池；确定未使用时调用 release 主动释放；仅在没有其他用途占用时轮换邮箱凭据。关闭后，按原有 leased → commit / release 流程。切换只影响新领取，已有记录保留原模式。
+          </p>
+          <p class="pool-hint">下方空闲库存和定时创建目标按“没有任何用途占用”的邮箱统计。上方库存状态按所选用途计算：Adobe 已用不影响 GPT 首次领取。暂停/恢复分配仍是全局操作。
           </p>
           <p class="pool-hint">
             本系统新创建并确认成功、凭据完整的匿名邮箱会直接进入库存，无需开启开关。下方开关仅用于将以后目录同步发现的新地址自动入池；已有邮箱在「邮箱库存」中手动选择加入。空闲目标为
@@ -509,7 +537,9 @@ const members = ref({ items: [], total: 0 }),
   accounts = ref([]);
 const immediateUsed = ref(true);
 const memberState = ref(""),
+  memberPurpose = ref("adobe"),
   leaseState = ref(""),
+  leasePurpose = ref("adobe"),
   search = ref(""),
   clientFilter = ref(""),
   projectName = ref("");
@@ -569,6 +599,8 @@ async function invertEnrollPage() {
 const secretOpen = ref(false),
   secretTitle = ref(""),
   secret = ref("");
+const purposes = ["common", "adobe", "gpt"];
+const purposeName = (p) => ({ common: "通用", adobe: "Adobe", gpt: "GPT" })[p] || p || "通用";
 const stateName = (s) =>
   ({
     available: "空闲",
@@ -614,6 +646,7 @@ async function loadMembers(signal) {
       "/pool/members?" +
         query({
           state: memberState.value,
+          purpose: memberPurpose.value,
           q: search.value,
           limit: 50,
           offset: (memberPage.value - 1) * 50,
@@ -629,6 +662,7 @@ async function loadLeases(signal) {
       "/pool/leases?" +
         query({
           state: leaseState.value,
+          purpose: leasePurpose.value,
           client_id: clientFilter.value,
           limit: 50,
           offset: (leasePage.value - 1) * 50,
@@ -937,7 +971,7 @@ async function copySecret() {
 }
 const claimExample = computed(
   () =>
-    `curl '${location.origin}/api/v1/pool/claim' \\\n  -H 'Authorization: Bearer PROJECT_KEY' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"request_id":"job-20260912-0001","count":1,"ttl_seconds":1800}'`,
+    `curl '${location.origin}/api/v1/pool/claim' \\\n  -H 'Authorization: Bearer PROJECT_KEY' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"request_id":"job-20260912-0001","count":1,"ttl_seconds":1800,"purpose":"common"}'`,
 );
 const codeExample = computed(
   () =>
