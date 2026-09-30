@@ -377,6 +377,9 @@ func (c *postgresMigrationCaptureConn) QueryContext(
 	if normalized == "select id, name, name_key from mail_groups order by id" {
 		return &postgresMigrationEmptyMailGroupRows{}, nil
 	}
+	if strings.Contains(normalized, "select exists") && strings.Contains(normalized, "information_schema.columns") && strings.Contains(normalized, "table_name='pool_leases'") && strings.Contains(normalized, "column_name='purpose'") {
+		return &postgresMigrationBoolRows{value: false}, nil
+	}
 	return nil, fmt.Errorf("unexpected PostgreSQL migration query: %s", query)
 }
 
@@ -418,4 +421,20 @@ func postgresMigrationStatementIndex(statements []string, wanted string) int {
 		}
 	}
 	return -1
+}
+
+type postgresMigrationBoolRows struct {
+	value bool
+	read  bool
+}
+
+func (*postgresMigrationBoolRows) Columns() []string { return []string{"exists"} }
+func (*postgresMigrationBoolRows) Close() error      { return nil }
+func (r *postgresMigrationBoolRows) Next(values []driver.Value) error {
+	if r.read {
+		return io.EOF
+	}
+	r.read = true
+	values[0] = r.value
+	return nil
 }

@@ -34,7 +34,7 @@ func TestPoolAliasRetirementPostgresMigrationConvergesAcrossVersions(t *testing.
 					`CREATE TABLE IF NOT EXISTS pool_alias_retirement_jobs ( operation_id TEXT PRIMARY KEY`,
 					`CREATE TABLE IF NOT EXISTS pool_alias_retirement_job_items ( operation_id TEXT NOT NULL REFERENCES pool_alias_retirement_jobs(operation_id) ON DELETE CASCADE`,
 					`ALTER TABLE pool_leases ADD CONSTRAINT pool_leases_state_check CHECK(state IN ('leased','used','retiring','retired','released','expired'))`,
-					`CREATE UNIQUE INDEX pool_one_live_lease ON pool_leases(alias_id) WHERE state IN ('leased','used','retiring')`,
+					`CREATE UNIQUE INDEX IF NOT EXISTS pool_one_live_purpose_lease ON pool_leases(alias_id,purpose) WHERE state IN ('leased','used','retiring')`,
 				} {
 					if !containsNormalizedSQLFragment(capture.statements, statement) {
 						t.Errorf("PostgreSQL pass %d omitted pool retirement convergence: %s", pass, normalizeSQL(statement))

@@ -21,6 +21,18 @@
         <el-tab-pane label="邮箱库存" name="members">
           <div class="pool-toolbar">
             <el-select
+              v-model="memberPurpose"
+              placeholder="用途：Adobe"
+              filterable
+              allow-create
+              @change="
+                memberPage = 1;
+                loadMembers();
+              "
+            >
+              <el-option v-for="p in purposes" :key="p" :label="purposeName(p)" :value="p" />
+            </el-select>
+            <el-select
               v-model="memberState"
               placeholder="全部状态"
               clearable
@@ -59,9 +71,11 @@
           <el-table
             :data="members.items"
             v-loading="loading"
-            empty-text="暂无库存。添加主号后，可加入已有邮箱或开启新邮箱自动入池。"
+            empty-text="暂无库存。新创建且确认成功的邮箱会自动入池；已有邮箱可手动加入。"
           >
+            <el-table-column label="序号" width="64" align="center"><template #default="{ $index }">{{ (memberPage - 1) * 50 + $index + 1 }}</template></el-table-column>
             <el-table-column prop="address" label="邮箱" min-width="245" />
+            <el-table-column label="用途" width="100"><template #default="{ row }">{{ purposeName(row.purpose) }}</template></el-table-column>
             <el-table-column prop="group_name" label="分组" min-width="110" />
             <el-table-column label="状态" width="135"
               ><template #default="{ row }"
@@ -108,6 +122,18 @@
         <el-tab-pane label="领取记录" name="leases">
           <div class="pool-toolbar">
             <el-select
+              v-model="leasePurpose"
+              placeholder="用途：Adobe"
+              filterable
+              allow-create
+              @change="
+                leasePage = 1;
+                loadLeases();
+              "
+            >
+              <el-option v-for="p in purposes" :key="p" :label="purposeName(p)" :value="p" />
+            </el-select>
+            <el-select
               v-model="leaseState"
               placeholder="全部状态"
               clearable
@@ -141,8 +167,10 @@
             v-loading="loading"
             empty-text="项目通过 API 领取邮箱后，记录会显示在这里。"
           >
+            <el-table-column label="序号" width="64" align="center"><template #default="{ $index }">{{ (leasePage - 1) * 50 + $index + 1 }}</template></el-table-column>
             <el-table-column prop="address" label="邮箱" min-width="230" />
             <el-table-column prop="project" label="项目" min-width="110" />
+            <el-table-column label="用途" width="100"><template #default="{ row }">{{ purposeName(row.purpose) }}</template></el-table-column>
             <el-table-column label="状态" width="100"
               ><template #default="{ row }"
                 ><el-tag :type="stateType(row.state)">{{
@@ -155,7 +183,7 @@
                 ><div>{{ date(row.created_at) }}</div>
                 <small>{{
                   row.state === "used"
-                    ? "已确认使用，保留分配"
+                    ? (row.immediate_use ? "领取即已使用，保留分配" : "已确认使用，保留分配")
                     : date(row.expires_at)
                 }}</small></template
               ></el-table-column
@@ -177,7 +205,7 @@
                   >确认使用</el-button
                 >
                 <el-button
-                  v-if="row.state === 'leased'"
+                  v-if="row.state === 'leased' || (row.state === 'used' && row.immediate_use)"
                   link
                   type="danger"
                   :disabled="busy"
@@ -213,7 +241,7 @@
             >
           </div>
           <p class="pool-hint">
-            每个项目使用独立 Key 领取邮箱，只能读取自己的领取记录。项目 Key
+            Key 用于鉴权，只能读取该 Key 的领取记录；多个项目可共用一把 Key，通过 purpose 区分用途。项目 Key
             仅在创建或轮换时展示。
           </p>
           <el-table
@@ -257,8 +285,23 @@
         </el-tab-pane>
 
         <el-tab-pane label="库存与定时创建" name="accounts">
+          <div class="pool-toolbar">
+            <span>领取即标记已使用</span>
+            <el-switch
+              :model-value="immediateUsed"
+              :disabled="busy || loading"
+              active-text="开启"
+              inactive-text="关闭"
+              @change="saveImmediateUsed"
+            />
+          </div>
           <p class="pool-hint">
-            开启自动入池后，新创建或新同步的邮箱会进入库存；已有邮箱在「邮箱库存」中手动选择加入。空闲目标为
+            开启后，项目调用 claim 会立即得到 used 状态，不会因领取期限到期自动回池；确定未使用时调用 release 主动释放；仅在没有其他用途占用时轮换邮箱凭据。关闭后，按原有 leased → commit / release 流程。切换只影响新领取，已有记录保留原模式。
+          </p>
+          <p class="pool-hint">下方空闲库存和定时创建目标按“没有任何用途占用”的邮箱统计。上方库存状态按所选用途计算：Adobe 已用不影响 GPT 首次领取。暂停/恢复分配仍是全局操作。
+          </p>
+          <p class="pool-hint">
+            本系统新创建并确认成功、凭据完整的匿名邮箱会直接进入库存，无需开启开关。下方开关仅用于将以后目录同步发现的新地址自动入池；已有邮箱在「邮箱库存」中手动选择加入。空闲目标为
             0
             时按计划创建；达到正数目标时跳过创建，领取后自动恢复。手动批量创建和单次探测均不使用本地创建额度，成功后不额外等待；仍受 Apple 实际响应影响。自动计划每主号滚动 1 小时最多 23 次：Apple Account 新通道 19 次、iCloud Web 旧通道 4 次，至少间隔 2 分钟并错峰执行。仅在明确限流且未产生地址时切换通道；结果不确定、含 HME 或目录确认中的尝试不会自动补造。明确限流默认暂停对应通道 1 小时，更长 Retry-After 以 Apple 为准。本地上限不代表 Apple 官方配额保证。
           </p>
@@ -277,7 +320,7 @@
                 ></template
               ></el-table-column
             >
-            <el-table-column label="新邮箱入池" width="120"
+            <el-table-column label="同步新地址入池" width="150"
               ><template #default="{ row }"
                 ><el-switch v-model="row.auto_enroll" /></template
             ></el-table-column>
@@ -342,19 +385,15 @@
               同一邮箱共用取件限流，429 时按 Retry-After 重试。可以追加
               after=RFC3339 时间，只查询更晚的邮件。
             </p>
-            <h3>3. 确认、释放或续期</h3>
+            <h3>3. 释放或确认使用</h3>
             <pre>
 POST /api/v1/pool/leases/LEASE_ID/commit
 POST /api/v1/pool/leases/LEASE_ID/release
 POST /api/v1/pool/leases/LEASE_ID/renew
 续期 JSON: {"ttl_seconds":1800}</pre
             >
-            <p>
-              默认领取 30 分钟，支持 60–86400 秒。成功后 commit
-              保留分配；release
-              或到期回收会轮换邮箱整套凭据。已确认使用的邮箱保持占用。所有请求均带项目
-              Bearer Key。
-            </p>
+            <p v-if="immediateUsed">当前已开启领取即已使用：claim 立即占用，不会到期回池；确定未使用时调用 release，释放时轮换邮箱整套凭据。commit 对已使用记录是幂等操作。所有请求均带项目 Bearer Key。</p>
+            <p v-else>当前为租用模式：默认领取 30 分钟，支持 60–86400 秒；commit 保留分配，release 或到期回收会轮换邮箱整套凭据。所有请求均带项目 Bearer Key。</p>
             <h3>4. 单邮箱 API、IMAPS 和 OAuth</h3>
             <pre>
 GET /api/v1/otp
@@ -496,8 +535,11 @@ const members = ref({ items: [], total: 0 }),
   leases = ref({ items: [], total: 0 }),
   clients = ref([]),
   accounts = ref([]);
+const immediateUsed = ref(true);
 const memberState = ref(""),
+  memberPurpose = ref("adobe"),
   leaseState = ref(""),
+  leasePurpose = ref("adobe"),
   search = ref(""),
   clientFilter = ref(""),
   projectName = ref("");
@@ -557,6 +599,8 @@ async function invertEnrollPage() {
 const secretOpen = ref(false),
   secretTitle = ref(""),
   secret = ref("");
+const purposes = ["common", "adobe", "gpt"];
+const purposeName = (p) => ({ common: "通用", adobe: "Adobe", gpt: "GPT" })[p] || p || "通用";
 const stateName = (s) =>
   ({
     available: "空闲",
@@ -602,6 +646,7 @@ async function loadMembers(signal) {
       "/pool/members?" +
         query({
           state: memberState.value,
+          purpose: memberPurpose.value,
           q: search.value,
           limit: 50,
           offset: (memberPage.value - 1) * 50,
@@ -617,6 +662,7 @@ async function loadLeases(signal) {
       "/pool/leases?" +
         query({
           state: leaseState.value,
+          purpose: leasePurpose.value,
           client_id: clientFilter.value,
           limit: 50,
           offset: (leasePage.value - 1) * 50,
@@ -635,6 +681,9 @@ async function refresh() {
   error.value = null;
   try {
     await Promise.all([
+      request("/pool/settings", "GET", undefined, controller.signal).then((result) => {
+        if (ticket === poolRefreshTicket) immediateUsed.value = result.immediate_used;
+      }),
       request("/pool/clients", "GET", undefined, controller.signal).then((result) => {
         if (ticket === poolRefreshTicket) clients.value = result;
       }),
@@ -724,6 +773,17 @@ async function saveAccount(row) {
       target: row.target,
     });
     ElMessage.success("库存设置已保存");
+  });
+}
+async function saveImmediateUsed(enabled) {
+  await mutate(async () => {
+    await ElMessageBox.confirm(
+      enabled ? "新领取将立即标记为已使用，只有主动 release 才会回池。" : "新领取将改为有期限的 leased，需 commit 才会长期占用。",
+      "切换领取模式",
+      { type: "warning" },
+    );
+    await request("/pool/settings", "PUT", { immediate_used: enabled });
+    ElMessage.success("领取模式已保存");
   });
 }
 async function toggleAutoCreate(row, enabled) {
@@ -911,7 +971,7 @@ async function copySecret() {
 }
 const claimExample = computed(
   () =>
-    `curl '${location.origin}/api/v1/pool/claim' \\\n  -H 'Authorization: Bearer PROJECT_KEY' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"request_id":"job-20260912-0001","count":1,"ttl_seconds":1800}'`,
+    `curl '${location.origin}/api/v1/pool/claim' \\\n  -H 'Authorization: Bearer PROJECT_KEY' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"request_id":"job-20260912-0001","count":1,"ttl_seconds":1800,"purpose":"common"}'`,
 );
 const codeExample = computed(
   () =>

@@ -39,8 +39,9 @@ func (s *Store) migrateAliasCreationEvents(ctx context.Context, tx *sql.Tx) erro
 	return nil
 }
 
-// Confirmation and its event share the alias transaction. Acknowledging keys,
-// disabling an alias, or deleting it later must not rewrite creation history.
+// Confirmation, its event, and pool enrollment share the alias transaction.
+// Directory imports never call this hook, so existing addresses are not
+// silently offered to another project as unused stock.
 func (s *Store) recordAliasCreationEventTx(ctx context.Context, tx *sql.Tx, alias domain.Alias) error {
 	_, err := s.txExecContext(ctx, tx, `
 		INSERT INTO apple_alias_creation_events(account_id, address, created_at)
@@ -48,6 +49,14 @@ func (s *Store) recordAliasCreationEventTx(ctx context.Context, tx *sql.Tx, alia
 		alias.AccountID, alias.Address, timestamp(alias.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("record Apple alias creation event: %w", err)
+	}
+	_, err = s.txExecContext(ctx, tx, `INSERT INTO pool_members(alias_id, state, updated_at)
+		SELECT al.id, 'available', ? FROM aliases al JOIN accounts a ON a.id=al.account_id
+		WHERE al.id=? AND al.enabled=TRUE AND a.enabled=TRUE
+		AND al.credential_mode='v2' AND al.credential_version>0
+		ON CONFLICT(alias_id) DO NOTHING`, timestamp(s.now()), alias.ID)
+	if err != nil {
+		return fmt.Errorf("enroll created Apple alias in pool: %w", err)
 	}
 	return nil
 }

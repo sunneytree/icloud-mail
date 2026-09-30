@@ -547,8 +547,9 @@
             :loading="loading"
           >
             <template #header-cell="{ column }">
+              <template v-if="column.key === 'rowNumber'">序号</template>
               <el-checkbox
-                v-if="column.key === 'selection'"
+                v-else-if="column.key === 'selection'"
                 :model-value="allAliasesSelected"
                 :indeterminate="someAliasesSelected"
                 :disabled="!selectableAliases.length || aliasSelectionBusy"
@@ -557,9 +558,10 @@
               />
               <template v-else>{{ column.title }}</template>
             </template>
-            <template #cell="{ column, rowData: row }">
+            <template #cell="{ column, rowData: row, rowIndex }">
+              <span v-if="column.key === 'rowNumber'">{{ (currentPage - 1) * pageSize + rowIndex + 1 }}</span>
               <el-checkbox
-                v-if="column.key === 'selection'"
+                v-else-if="column.key === 'selection'"
                 :model-value="selectedAliasIds.includes(row.id)"
                 :data-selection-id="row.id"
                 :data-selection-disabled="isAliasConfirmationPending(row) || aliasSelectionBusy"
@@ -681,7 +683,7 @@
           class="mobile-record-list"
           :aria-busy="loading"
         >
-          <article v-for="alias in aliases" :key="alias.id" class="mobile-record">
+          <article v-for="(alias, aliasIndex) in aliases" :key="alias.id" class="mobile-record">
             <header class="mobile-record__header">
               <el-checkbox
                 v-if="!isCustomMailbox"
@@ -692,6 +694,7 @@
                 :aria-label="`勾选 ${alias.address}`"
                 @change="setAliasSelected(alias, $event)"
               />
+              <span class="mobile-record__index">{{ (currentPage - 1) * pageSize + aliasIndex + 1 }}</span>
               <div class="primary-stack">
                 <strong>{{ alias.address }}</strong>
                 <small>{{ alias.label || "未填写用途备注" }}</small>
@@ -1124,6 +1127,7 @@ const appleVerificationRules = {
   ],
 };
 const aliasColumns = Object.freeze([
+  { key: "rowNumber", title: "序号", width: 64, minWidth: 64, align: "center" },
   { key: "selection", title: "", width: 48, minWidth: 48, align: "center" },
   {
     key: "address",

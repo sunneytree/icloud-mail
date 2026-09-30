@@ -11,9 +11,9 @@
 ## 首次配置
 
 1. 在「主号管理」添加 iCloud 主号和 App 专用密码，完成 Apple 登录和 2FA，同步已有隐私邮箱。
-2. 在「邮箱池 → 库存与定时创建」开启新邮箱入池，设置空闲目标并保存。目标 0 表示持续按原计划创建；正数表示达到目标后跳过远端创建。
+2. 本系统新创建并确认成功、凭据完整的匿名邮箱会自动入池，无需开启开关。在「邮箱池 → 库存与定时创建」可设置空闲目标；目标 0 表示持续按原计划创建，正数表示达到目标后跳过远端创建。
 3. 如需定时创建，由管理员主动开启。自动计划按新通道 19 次/小时、旧通道 4 次/小时分别记账；仅明确限流且未产生地址时切换通道。手动批量和单次探测直接请求 Apple；批量明确限流默认等待 1 小时或 Apple 更长，单次探测不使用本地额度或间隔。实际创建量以 Apple 返回为准。
-4. 在「邮箱库存」选择已确认可分配的已有地址加入池。启用自动入池之前存在的地址保持原状；之后创建或首次同步进入本地的地址自动入池。
+4. 在「邮箱库存」选择已确认可分配的已有地址加入池。已有及历史同步地址不会因本次更新自动入池；「同步新地址入池」开关仅控制之后目录同步发现的新地址。
 5. 在「项目 API Key」创建项目，保存一次性展示的 Key。每个项目的领取记录独立，所有项目共享管理员加入的空闲库存。
 
 旧的 40 次/小时计划及其频率升级记录属于历史策略；新计划默认关闭，升级保留已有计划的开启/关闭状态。
@@ -27,7 +27,7 @@ Apple 未登录时先完成登录，再点击创建。明确限流进入等待�
 - Apple 上游配额、主号启用状态、邮箱容量和结果确认仍生效。手动与自动共用账号锁。
 - 手动批量的 `auto` 仅选择初始通道；自动定时计划则按新旧通道余量调度，明确限流且未产生地址时可切换。明确选择的通道不会自动改变。Apple Account 需要独立登录和 2FA，且仍需旧 Web 登录以同步地址归属。
 - 手动批量收到 Apple 明确限流后默认等待 1 小时或 Apple 更长，不主动切换；自动计划的本地预算等待是独立状态。历史已有冷却不自动清除。任务生命周期 7 天；重启后 interrupted 任务不会自动重发，需人工确认。单次探测仅反馈本次结果，不自动重试，沿用 Apple 本次返回的 Retry-After。
-- 成功后从隐私邮箱列表复制完整凭据。若启用自动入池，新邮箱按原入池流程进入库存。
+- 成功且目录确认完成、凭据完整后，新邮箱在同一数据库事务中直接进入库存；无需手动加入。
 - 关闭页面不会停止任务；需点击「停止后续创建」。结果不明时先刷新/同步目录，避免重复提交。
 
 后台任务接口（管理员 session Cookie + `X-CSRF-Token`）：
@@ -43,6 +43,14 @@ Apple 未登录时先完成登录，再点击创建。明确限流进入等待�
 成功返回 `201 {"data":{"alias":ALIAS_DTO}}`，包含完整凭据且 `Cache-Control: no-store`。
 同主号并发手动请求返回 `409 ALIAS_CREATION_BUSY`；Apple 限流返回 `429 APPLE_RATE_LIMITED`，可用时附带 `Retry-After`。
 
+## 对外领取默认直接标记已使用
+
+`ICLOUD_API_POOL_CLAIM_IMMEDIATE_USED=yes`（默认）时，对外 `POST /api/v1/pool/claim` 在同一数据库事务中直接把领取记录和库存标记为 `used`。不需要再调用 `/commit`，也不会因 `ttl_seconds` 到期自动回池；该字段在此模式下仅保留兼容性。确认从未实际使用的邮箱可显式调用 `/release`，服务会轮换本地邮箱访问凭据并把它放回空闲池。**已经对外暴露或收到业务邮件的地址不应释放复用**，轮换凭据不能阻止 Apple 继续向该地址投递。
+
+管理员可在「邮箱池 → 库存与定时创建」直接切换此模式；`GET/PUT /admin/api/v1/pool/settings`（管理员 Session + 写入时 CSRF）读取/保存 `{"immediate_used":true|false}`。页面保存后立即生效，不需重启；环境变量只决定尚未保存页面设置时的默认值。
+
+设置为 `no` 时沿用原先的 `available → leased → used` 流程：到期未 `/commit` 会回池；已提交 `used` 的领取不接受 `/release`。设置只影响此后新请求，每条领取记录保存当时的模式，不会改变已有领取状态。即使之后切换开关，旧模式下 `/commit` 的记录也不能被 `/release`。
+
 ## 领取和使用
 
 外部邮箱池接口统一使用 `Authorization: Bearer PROJECT_KEY`，PROJECT_KEY 以 `pool_` 开头。
@@ -56,7 +64,7 @@ curl 'https://mail.example.com/api/v1/pool/claim' \
 
 可选 `account_id`、`group_id` 限定主号或分组。`count` 默认 1，范围 1–50；`ttl_seconds` 默认 1800，范围 60–86400。`request_id` 必填，8–128 个字母、数字、横线或下划线。
 
-领取前持久化 request_id 和原参数。相同项目、相同编号和相同参数重试会返回原领取记录；参数变化返回 `409 IDEMPOTENCY_CONFLICT`。库存不足返回 `409 POOL_EMPTY`，整批保持未分配状态。领取完成后重试旧编号仍返回原记录，只有仍在领取期或已经确认使用的记录会带邮箱凭据。
+领取前持久化 request_id 和原参数。相同项目、相同编号和相同参数重试会返回原领取记录；参数变化返回 `409 IDEMPOTENCY_CONFLICT`。库存不足返回 `409 POOL_EMPTY`，整批保持未分配状态。领取完成后重试旧编号仍返回原记录，只有仍在领取期或处于 `used` 状态的记录会带邮箱凭据。
 
 ## 已使用邮箱退休删除
 
@@ -114,7 +122,7 @@ curl 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-
         "address": "alias@icloud.com",
         "project": "my-app",
         "request_id": "job-20260912-0001",
-        "state": "leased",
+        "state": "used",
         "created_at": "2026-09-12T08:00:00Z",
         "expires_at": "2026-09-12T08:30:00Z"
       },
@@ -144,9 +152,9 @@ curl 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-
 | `GET /api/v1/pool/leases` | 当前项目的领取记录，支持 state、limit、offset |
 | `GET /api/v1/pool/leases/LEASE_ID` | 取回领取记录及仍有效的完整邮箱凭据 |
 | `GET /api/v1/pool/leases/LEASE_ID/code` | 查询领取时间之后的最新六位验证码 |
-| `POST /api/v1/pool/leases/LEASE_ID/commit` | 确认使用，持续保留邮箱分配 |
-| `POST /api/v1/pool/leases/LEASE_ID/release` | 释放尚未确认使用的邮箱，并轮换邮箱凭据 |
-| `POST /api/v1/pool/leases/LEASE_ID/renew` | JSON `{"ttl_seconds":1800}`，从当前时间续期 |
+| `POST /api/v1/pool/leases/LEASE_ID/commit` | `no` 模式下确认使用；默认 `yes` 模式已是 `used`，重复调用仅返回当前记录 |
+| `POST /api/v1/pool/leases/LEASE_ID/release` | 默认 `yes` 模式可显式释放 `used`；`no` 模式只可释放未提交的 `leased`。两者均轮换凭据 |
+| `POST /api/v1/pool/leases/LEASE_ID/renew` | 仅 `no` 模式的 `leased` 可用；JSON `{"ttl_seconds":1800}`，从当前时间续期 |
 
 `code` 可追加 `after=RFC3339`，查询起点取 after 与领取时间中较晚者；`data.success=true` 时读取 `data.otp` 和 `data.time`，否则 `data.code=no_code`、`data.retryable=true`。请求与该邮箱的 OTP、Bearer 和直达链接共用速率预算：共享模式容量 2、每 2 秒恢复 1 次；长等待期间也恢复，完成后不追加冷却。普通读取和单个长等待可共存，第二个同类在途或额度/容量已满返回 `429 RATE_LIMITED`。`X-RateLimit-Reason` 标识原因，`Retry-After` 按剩余时间向上取整，`X-Retry-After-Ms` 提供毫秒值；被拦截请求不延期。旧非共享路径仍保持单 alias 独占和完成后 2 秒冷却。详见 [分层取件限流](PICKUP-RATE.md)。
 
@@ -166,7 +174,7 @@ curl 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-
 
 ## 状态与凭据
 
-- 空闲 → 已领取 → 已使用。已使用邮箱持续分配，过期回收只处理尚未确认的领取。
+- 默认 `yes`：空闲 → 已使用；设置 `no`：空闲 → 已领取 → 已使用。已使用邮箱持续分配，过期回收只处理 `leased`。
 - 释放或到期回收后，邮箱回到空闲；领取及回收均在事务中轮换 API Key、IMAP 密码、client_id 和 refresh_token，旧访问令牌随凭据版本失效。
 - 后台每 15 秒检查到期记录，每轮最多 200 条。过期的领取接口立即停止返回凭据和验证码；已经发出的邮箱凭据在回收事务提交时失效。
 - 重新入池只忽略已经入池的记录，不重置已领取或已使用状态。暂停分配只作用于空闲邮箱。
@@ -211,3 +219,16 @@ npm ci
 npm test
 npm run build
 ```
+
+
+## 按用途分配（purpose）
+
+`POST /api/v1/pool/claim` 增加 `purpose`，如 `{"request_id":"adobe-job-0001","count":1,"purpose":"adobe"}`。省略、空字符串或纯空格归为 `common`；去首尾空格、转小写，仅允许 1–64 个 ASCII 字母、数字、下划线、短横线。
+
+Key 负责鉴权；用途在整个邮箱池内隔离使用状态，并不绑定 Key。相同邮箱可分别用于 adobe 和 gpt，同一用途不能重复分配。请求编号仍在同一个 Key 下唯一；重试必须使用原参数（包括 purpose），不同用途应使用不同 request_id。领取响应 lease.purpose 返回归一化后的用途。
+
+release/commit/renew 仍按 lease ID 操作，无需另传 purpose，不会修改其他用途状态。存在其他用途的活动领取时不会轮换共享的邮箱凭据。用途不是收件隔离或权限隔离：同一邮箱收到的邮件仍共用。
+
+启动迁移仅执行一次：旧 used/retiring/retired 领取归到 adobe，其他旧记录归 common；没有领取记录的旧已用库存保留 adobe 使用标记。之后新产生的 common 记录不会在重启时再次迁走。
+
+管理库存 API `GET /admin/api/v1/pool/members?purpose=adobe` 按用途返回状态（默认 common）；领取列表可用 `purpose` 过滤。页面默认 Adobe，支持通用/GPT/自定义用途。暂停/恢复、主号停用、Apple 删除仍为全局；存在多个用途活动领取时禁止按单个领取删除 Apple 邮箱。自动补库存目标按全局无占用地址计算。

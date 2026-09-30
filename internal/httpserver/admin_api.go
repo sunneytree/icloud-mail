@@ -1293,6 +1293,7 @@ func (s *Server) adminAPIAccountDetailPage(
 		return adminAPIAccountDetailDTO{}, err
 	}
 	page, err := s.store.ListAliasesPage(ctx, store.AliasListFilter{
+		NewestFirst:         true,
 		AccountID:           &id,
 		OnlyEnabledAccounts: true,
 		Limit:               limit,

@@ -68,21 +68,44 @@ func TestAliasCreationEventLifecycle(t *testing.T) {
 	if count() != 0 {
 		t.Fatal("pending alias counted")
 	}
+	poolCount := func() int {
+		page, e := db.ListPoolMembers(ctx, "", "", 50, 0)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return page.Total
+	}
+	if poolCount() != 0 {
+		t.Fatal("pending alias entered pool")
+	}
 	if _, _, err = db.ConfirmPendingAutoAlias(ctx, domain.AppleWebSession{AccountID: a.ID, Ciphertext: "confirmed", AppleID: a.Email, Authenticated: true}, al.ID); err != nil {
 		t.Fatal(err)
 	}
 	if count() != 1 {
 		t.Fatal("confirmed alias not counted")
 	}
+	if poolCount() != 1 {
+		t.Fatalf("confirmed alias pool count=%d, want 1", poolCount())
+	}
 	// Simulate an old installation: recover only confirmed creation markers,
 	// not directory imports or addresses awaiting Apple confirmation.
 	unconfirmed := createAlias(t, ctx, db, a.ID, "pending@icloud.com", []byte("pending-test-hash"))
-	if _, err := db.DB().ExecContext(ctx, `UPDATE aliases SET enabled = 0, last_sync_error = ? WHERE id = ?`, domain.AppleAliasConfirmationPending, unconfirmed.ID); err != nil { t.Fatal(err) }
-	if _, err := db.DB().ExecContext(ctx, `INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at) VALUES (?, ?, ?)`, unconfirmed.ID, pending, now.UnixNano()); err != nil { t.Fatal(err) }
-	if _, err := db.DB().ExecContext(ctx, `DELETE FROM apple_alias_creation_events`); err != nil { t.Fatal(err) }
+	if _, err := db.DB().ExecContext(ctx, `UPDATE aliases SET enabled = 0, last_sync_error = ? WHERE id = ?`, domain.AppleAliasConfirmationPending, unconfirmed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at) VALUES (?, ?, ?)`, unconfirmed.ID, pending, now.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `DELETE FROM apple_alias_creation_events`); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 2; i++ {
-		if err := db.Migrate(ctx); err != nil { t.Fatal(err) }
-		if count() != 1 { t.Fatal("migration must backfill confirmed markers exactly once") }
+		if err := db.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if count() != 1 {
+			t.Fatal("migration must backfill confirmed markers exactly once")
+		}
 	}
 	if err = db.DeletePendingAliasAPIKeys(ctx, a.ID, []int64{al.ID}); err != nil {
 		t.Fatal(err)
@@ -95,6 +118,45 @@ func TestAliasCreationEventLifecycle(t *testing.T) {
 	}
 	if count() != 1 {
 		t.Fatal("delete changed event")
+	}
+}
+
+func TestConfirmedAppleAliasImmediatelyEntersPoolWithoutOptIn(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	cipher, err := secure.NewCipher(bytes.Repeat([]byte{0x7b}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.ConfigureAliasCredentialReuseFactory(func(id, v int64, pending string) (domain.AliasCredentialMaterial, error) {
+		key, e := cipher.DecryptPendingAliasAPIKey(pending)
+		if e != nil {
+			return domain.AliasCredentialMaterial{}, e
+		}
+		_, material, e := secure.NewAliasCredentialMaterialWithAPIKey(cipher, id, v, key)
+		return material, e
+	})
+	account := createAccount(t, ctx, db, "Immediate", "immediate@icloud.com")
+	raw, hash, prefix, err := secure.NewAPIKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := cipher.EncryptPendingAliasAPIKey(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias, _, err := db.CreateAliasWithPendingAPIKey(ctx,
+		domain.AppleWebSession{AccountID: account.ID, Ciphertext: "session", AppleID: account.Email, Authenticated: true},
+		domain.Alias{AccountID: account.ID, Address: "immediate-alias@icloud.com", APIKeyHash: hash, APIKeyPrefix: prefix, Enabled: true}, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := db.ListPoolMembers(ctx, "", "", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || page.Items[0].AliasID != alias.ID || page.Items[0].State != "available" {
+		t.Fatalf("confirmed alias not stocked: %#v", page)
 	}
 }
 
@@ -111,13 +173,19 @@ func TestRecentAliasCreationEventsAreAccountAndWindowScoped(t *testing.T) {
 	a1 := createAccount(t, ctx, db, "Events one", "events-one@icloud.com")
 	a2 := createAccount(t, ctx, db, "Events two", "events-two@icloud.com")
 	now := time.Now().UTC().Truncate(time.Second)
-	for _, event := range []struct { account int64; address string; at time.Time }{
+	for _, event := range []struct {
+		account int64
+		address string
+		at      time.Time
+	}{
 		{a1.ID, "lower@icloud.com", now.Add(-time.Second)},
 		{a1.ID, "upper@icloud.com", now},
 		{a1.ID, "future@icloud.com", now.Add(time.Nanosecond)},
 		{a2.ID, "other@icloud.com", now},
 	} {
-		if _, err := db.DB().ExecContext(ctx, `INSERT INTO apple_alias_creation_events(account_id, address, created_at) VALUES (?, ?, ?)`, event.account, event.address, event.at.UnixNano()); err != nil { t.Fatal(err) }
+		if _, err := db.DB().ExecContext(ctx, `INSERT INTO apple_alias_creation_events(account_id, address, created_at) VALUES (?, ?, ?)`, event.account, event.address, event.at.UnixNano()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, tc := range []struct {
 		name         string
