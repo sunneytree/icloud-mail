@@ -355,7 +355,7 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 	}
 	normalizeSession(&updated, record.AppleID, validated.Region, s.now())
 
-	filtered, inactive, err := filterAliases(list, account.Email)
+	filtered, inactive, err := filterAliases(list, account.Email, account.VerifyForwardingTarget)
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -900,7 +900,7 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending,
 				errors.New("Apple returned an inactive pending alias"))
 		}
-		if !sameEmail(confirmed.ForwardToEmail, account.Email) {
+		if account.VerifyForwardingTarget && !sameEmail(confirmed.ForwardToEmail, account.Email) {
 			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
 		sessionRecord, err := s.autoCreateSessionRecord(accountID, record.AppleID, trustedDSID, validated.Region, returned)
@@ -1027,7 +1027,10 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 			return domain.Alias{}, store.ErrAliasLimit
 		}
 	}
-	forwardingErr := validateAutoCreateForwardingTarget(settings, account.Email)
+	var forwardingErr error
+	if account.VerifyForwardingTarget {
+		forwardingErr = validateAutoCreateForwardingTarget(settings, account.Email)
+	}
 	if errors.Is(forwardingErr, ErrForwardingTargetMissing) {
 		updater, canUpdate := s.client.(ForwardingTargetUpdater)
 		if !canUpdate || len(settings.Aliases) != 0 ||
@@ -1107,7 +1110,9 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 		}
 		settings = verifiedSettings
 		listedSession = verifiedSession
-		forwardingErr = validateAutoCreateForwardingTarget(settings, account.Email)
+		if account.VerifyForwardingTarget {
+			forwardingErr = validateAutoCreateForwardingTarget(settings, account.Email)
+		}
 		if callerErr := ctx.Err(); callerErr != nil {
 			return domain.Alias{}, callerErr
 		}
@@ -1262,7 +1267,7 @@ func (s *Service) createAliasWithChannel(ctx context.Context, accountID int64, c
 				errors.New("Apple returned an inactive reserved alias"),
 			)
 		}
-		if !sameEmail(created.ForwardToEmail, account.Email) {
+		if account.VerifyForwardingTarget && !sameEmail(created.ForwardToEmail, account.Email) {
 			reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, 1)
 			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
@@ -1655,8 +1660,9 @@ func (s *Service) expireSession(ctx context.Context, accountID int64) {
 	})
 }
 
-func filterAliases(result apple.ListResult, accountEmail string) ([]apple.Alias, int, error) {
+func filterAliases(result apple.ListResult, accountEmail string, verifyForwardingTarget ...bool) ([]apple.Alias, int, error) {
 	accountEmail = domain.NormalizeEmail(accountEmail)
+	verify := len(verifyForwardingTarget) == 0 || verifyForwardingTarget[0]
 	belongs := sameEmail(result.SelectedForwardTo, accountEmail)
 	for _, address := range result.ForwardToEmails {
 		belongs = belongs || sameEmail(address, accountEmail)
@@ -1685,7 +1691,7 @@ func filterAliases(result apple.ListResult, accountEmail string) ([]apple.Alias,
 			}
 			seenRemoteIDs[remoteID] = struct{}{}
 		}
-		if sameEmail(remote.ForwardToEmail, accountEmail) {
+		if !verify || sameEmail(remote.ForwardToEmail, accountEmail) {
 			belongs = true
 			remote.HME = address
 			filtered = append(filtered, remote)
@@ -1694,7 +1700,7 @@ func filterAliases(result apple.ListResult, accountEmail string) ([]apple.Alias,
 			}
 		}
 	}
-	if !belongs {
+	if verify && !belongs {
 		return nil, 0, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 	}
 	return filtered, inactive, nil

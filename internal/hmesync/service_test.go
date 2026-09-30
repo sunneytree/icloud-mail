@@ -1371,6 +1371,28 @@ func TestCreateAutoAliasRejectsExplicitReserveForwardMismatch(t *testing.T) {
 	}
 }
 
+func TestCreateAliasForwardingVerificationOffAllowsDomainTarget(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.account.VerifyForwardingTarget = false
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{SelectedForwardTo: "domain@example.com"}, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			return apple.Alias{HME: "domain-alias@icloud.com", ForwardToEmail: "domain@example.com", IsActive: true}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+	created, err := service.CreateAutoAlias(ctx, 3)
+	if err != nil || created.Address != "domain-alias@icloud.com" || client.createCalls.Load() != 1 {
+		t.Fatalf("domain-forwarded alias: created=%#v err=%v reserves=%d", created, err, client.createCalls.Load())
+	}
+}
+
 func TestCreateAutoAliasRejectsExplicitInactiveReserveResult(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
@@ -2552,6 +2574,9 @@ type fakeRepository struct {
 }
 
 func newFakeRepository(account domain.Account, now time.Time) *fakeRepository {
+	// Legacy test scenarios exercise the strict policy unless a test explicitly
+	// turns it off. Persisted production accounts default to false.
+	account.VerifyForwardingTarget = true
 	return &fakeRepository{
 		account:  account,
 		sessions: make(map[int64]domain.AppleWebSession),

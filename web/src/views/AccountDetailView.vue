@@ -283,6 +283,24 @@
 
       <section class="section-block">
 
+        <div v-if="!isCustomMailbox" class="auto-creation-panel forwarding-policy-panel">
+          <div class="auto-creation-panel__header">
+            <div class="auto-creation-panel__copy">
+              <h3>校验默认转发目标</h3>
+              <p class="field-help">默认关闭：允许转发到你设置的域名邮箱。开启后，创建、确认和目录同步时要求转发目标与当前主号邮箱一致；Apple 会话身份一致性校验始终保留。</p>
+            </div>
+            <el-switch
+              :model-value="Boolean(account.verifyForwardingTarget)"
+              :loading="forwardingPolicyLoading"
+              :disabled="forwardingPolicyLoading || detailMutationPending() || !account.enabled"
+              active-text="开启"
+              inactive-text="关闭"
+              aria-label="校验默认转发目标"
+              @change="toggleForwardingPolicy"
+            />
+          </div>
+        </div>
+
         <div
           v-if="autoCreation && !isCustomMailbox"
           class="auto-creation-panel"
@@ -926,6 +944,7 @@ import {
   setAliasEnabled,
   syncAccount,
   syncAccountAliases,
+  updateAccountForwardingPolicy,
   verifyAppleSession,
   startAliasDeletionJob,
   updateAccountMailTransport,
@@ -979,6 +998,7 @@ const router = useRouter();
 const auth = useAuth();
 const account = ref(null);
 const mailTransportLoading = ref(false);
+const forwardingPolicyLoading = ref(false);
 const aliases = ref([]);
 const currentPage = ref(1);
 const pageSize = ref(DEFAULT_PAGE_SIZE);
@@ -1812,6 +1832,27 @@ async function changeMailTransport(transport) {
     showRequestError(error, "收件通道切换失败。");
   } finally {
     mailTransportLoading.value = false;
+  }
+}
+
+async function toggleForwardingPolicy(value) {
+  if (!account.value || forwardingPolicyLoading.value || !account.value.enabled) return;
+  const accountId = account.value.id;
+  const previous = Boolean(account.value.verifyForwardingTarget);
+  forwardingPolicyLoading.value = true;
+  account.value.verifyForwardingTarget = Boolean(value);
+  try {
+    const next = await updateAccountForwardingPolicy(accountId, value, auth.state.csrfToken);
+    if (!isCurrentAccount(accountId)) return;
+    account.value.verifyForwardingTarget = next.verifyForwardingTarget;
+    successMessage(Boolean(value) ? "已开启默认转发目标校验。" : "已关闭默认转发目标校验。");
+  } catch (error) {
+    if (isCurrentAccount(accountId)) {
+      account.value.verifyForwardingTarget = previous;
+      showRequestError(error, "更新默认转发目标校验设置失败。");
+    }
+  } finally {
+    forwardingPolicyLoading.value = false;
   }
 }
 

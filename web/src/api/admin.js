@@ -146,6 +146,7 @@ export function normalizeAccount(raw = {}) {
       "",
     enabled: Boolean(firstDefined(raw, "enabled", "Enabled")),
     mailTransport: firstDefined(raw, "mail_transport", "mailTransport") === "webmail" ? "webmail" : "imap",
+    verifyForwardingTarget: Boolean(firstDefined(raw, "verify_forwarding_target", "verifyForwardingTarget")),
     lastSyncStatus:
       firstDefined(raw, "last_sync_status", "lastSyncStatus", "LastSyncStatus") ||
       "pending",
@@ -629,6 +630,15 @@ export async function updateAccountMailTransport(id, transport, csrfToken) {
     csrfToken,
   });
   return data?.transport === "webmail" ? "webmail" : "imap";
+}
+
+export async function updateAccountForwardingPolicy(id, verifyForwardingTarget, csrfToken) {
+  const data = await apiRequest(`/accounts/${encodeURIComponent(id)}/forwarding-policy`, {
+    method: "PUT",
+    body: { verify_forwarding_target: Boolean(verifyForwardingTarget) },
+    csrfToken,
+  });
+  return normalizeAccount(data?.account || data || {});
 }
 
 export function normalizeMailGroup(raw = {}) {

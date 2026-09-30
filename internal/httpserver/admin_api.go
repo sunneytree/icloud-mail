@@ -67,6 +67,7 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.POST("/accounts", s.adminAPICreateAccount(basePath))
 	protected.GET("/accounts/:id", s.adminAPIGetAccount)
 	protected.PUT("/accounts/:id", s.adminAPIUpdateAccount)
+	protected.PUT("/accounts/:id/forwarding-policy", s.adminAPISetForwardingPolicy)
 	protected.DELETE("/accounts/:id", s.adminAPIDeleteAccount)
 	protected.POST("/accounts/:id/sync", s.adminAPISyncAccount)
 	protected.PUT("/accounts/:id/mail-transport", s.adminAPISetMailTransport)
@@ -124,24 +125,25 @@ type adminAPISessionDTO struct {
 }
 
 type adminAPIAccountDTO struct {
-	ID               int64                    `json:"id"`
-	Name             string                   `json:"name"`
-	Email            string                   `json:"email"`
-	IMAPHost         string                   `json:"imap_host"`
-	IMAPPort         int                      `json:"imap_port"`
-	IMAPUsername     string                   `json:"imap_username"`
-	Enabled          bool                     `json:"enabled"`
-	LastSyncStatus   string                   `json:"last_sync_status"`
-	LastSyncError    string                   `json:"last_sync_error"`
-	LastSyncErrorLog string                   `json:"last_sync_error_log"`
-	LastSyncedAt     *string                  `json:"last_synced_at"`
-	CreatedAt        string                   `json:"created_at"`
-	UpdatedAt        string                   `json:"updated_at"`
-	AliasCount       int                      `json:"alias_count"`
-	MailboxType      string                   `json:"mailbox_type"`
-	Provider         string                   `json:"provider"`
-	EmailSuffix      string                   `json:"email_suffix"`
-	SyncProgress     *adminAPISyncProgressDTO `json:"sync_progress,omitempty"`
+	ID                     int64                    `json:"id"`
+	VerifyForwardingTarget bool                     `json:"verify_forwarding_target"`
+	Name                   string                   `json:"name"`
+	Email                  string                   `json:"email"`
+	IMAPHost               string                   `json:"imap_host"`
+	IMAPPort               int                      `json:"imap_port"`
+	IMAPUsername           string                   `json:"imap_username"`
+	Enabled                bool                     `json:"enabled"`
+	LastSyncStatus         string                   `json:"last_sync_status"`
+	LastSyncError          string                   `json:"last_sync_error"`
+	LastSyncErrorLog       string                   `json:"last_sync_error_log"`
+	LastSyncedAt           *string                  `json:"last_synced_at"`
+	CreatedAt              string                   `json:"created_at"`
+	UpdatedAt              string                   `json:"updated_at"`
+	AliasCount             int                      `json:"alias_count"`
+	MailboxType            string                   `json:"mailbox_type"`
+	Provider               string                   `json:"provider"`
+	EmailSuffix            string                   `json:"email_suffix"`
+	SyncProgress           *adminAPISyncProgressDTO `json:"sync_progress,omitempty"`
 }
 
 type adminAPISyncProgressDTO struct {
@@ -390,23 +392,24 @@ func adminAPISessionFromDomain(session domain.Session) adminAPISessionDTO {
 
 func adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
 	return adminAPIAccountDTO{
-		ID:               account.ID,
-		Name:             account.Name,
-		Email:            account.Email,
-		IMAPHost:         account.IMAPHost,
-		IMAPPort:         account.IMAPPort,
-		IMAPUsername:     account.IMAPUsername,
-		Enabled:          account.Enabled,
-		LastSyncStatus:   account.LastSyncStatus,
-		LastSyncError:    adminAPISyncErrorSummary(account.LastSyncError),
-		LastSyncErrorLog: account.LastSyncError,
-		LastSyncedAt:     adminAPIOptionalTime(account.LastSyncedAt),
-		CreatedAt:        adminAPITime(account.CreatedAt),
-		UpdatedAt:        adminAPITime(account.UpdatedAt),
-		AliasCount:       account.AliasCount,
-		MailboxType:      domain.NormalizeMailboxType(account.MailboxType),
-		Provider:         domain.NormalizeMailboxType(account.MailboxType),
-		EmailSuffix:      account.EmailSuffix,
+		ID:                     account.ID,
+		VerifyForwardingTarget: account.VerifyForwardingTarget,
+		Name:                   account.Name,
+		Email:                  account.Email,
+		IMAPHost:               account.IMAPHost,
+		IMAPPort:               account.IMAPPort,
+		IMAPUsername:           account.IMAPUsername,
+		Enabled:                account.Enabled,
+		LastSyncStatus:         account.LastSyncStatus,
+		LastSyncError:          adminAPISyncErrorSummary(account.LastSyncError),
+		LastSyncErrorLog:       account.LastSyncError,
+		LastSyncedAt:           adminAPIOptionalTime(account.LastSyncedAt),
+		CreatedAt:              adminAPITime(account.CreatedAt),
+		UpdatedAt:              adminAPITime(account.UpdatedAt),
+		AliasCount:             account.AliasCount,
+		MailboxType:            domain.NormalizeMailboxType(account.MailboxType),
+		Provider:               domain.NormalizeMailboxType(account.MailboxType),
+		EmailSuffix:            account.EmailSuffix,
 	}
 }
 

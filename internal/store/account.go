@@ -19,7 +19,9 @@ const accountColumns = `
 	COALESCE((SELECT ams.mailbox_type FROM account_mailbox_settings ams
 		WHERE ams.account_id = a.id), 'icloud') AS mailbox_type,
 	COALESCE((SELECT ams.email_suffix FROM account_mailbox_settings ams
-		WHERE ams.account_id = a.id), '') AS email_suffix`
+		WHERE ams.account_id = a.id), '') AS email_suffix,
+	COALESCE((SELECT afp.verify_forwarding_target FROM account_forwarding_policy afp
+		WHERE afp.account_id = a.id), FALSE) AS verify_forwarding_target`
 
 type AccountListFilter struct {
 	Query  string
@@ -620,6 +622,7 @@ func (s *Store) UpdateAccountSyncStatus(
 func scanAccount(scanner rowScanner) (domain.Account, error) {
 	var account domain.Account
 	var enabled bool
+	var verifyForwardingTarget bool
 	var lastSyncedAt sql.NullInt64
 	var createdAt, updatedAt int64
 	err := scanner.Scan(
@@ -627,7 +630,7 @@ func scanAccount(scanner rowScanner) (domain.Account, error) {
 		&account.IMAPUsername, &account.PasswordCiphertext, &enabled,
 		&account.LastSyncStatus, &account.LastSyncError, &lastSyncedAt,
 		&createdAt, &updatedAt, &account.AliasCount,
-		&account.MailboxType, &account.EmailSuffix,
+		&account.MailboxType, &account.EmailSuffix, &verifyForwardingTarget,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -636,6 +639,7 @@ func scanAccount(scanner rowScanner) (domain.Account, error) {
 		return domain.Account{}, fmt.Errorf("scan account: %w", err)
 	}
 	account.Enabled = enabled
+	account.VerifyForwardingTarget = verifyForwardingTarget
 	account.LastSyncedAt = timePtr(lastSyncedAt)
 	account.CreatedAt = timeFromTimestamp(createdAt)
 	account.UpdatedAt = timeFromTimestamp(updatedAt)
