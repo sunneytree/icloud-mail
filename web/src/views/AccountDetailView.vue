@@ -287,7 +287,7 @@
           <div class="auto-creation-panel__header">
             <div class="auto-creation-panel__copy">
               <h3>校验默认转发目标</h3>
-              <p class="field-help">默认关闭：允许转发到你设置的域名邮箱。开启后，创建、确认和目录同步时要求转发目标与当前主号邮箱一致；Apple 会话身份一致性校验始终保留。</p>
+              <p class="field-help">默认关闭：允许转发到你设置的域名邮箱。开启后，创建、确认、目录同步和删除时要求转发目标与当前主号邮箱一致；Apple 会话身份一致性校验始终保留。</p>
             </div>
             <el-switch
               :model-value="Boolean(account.verifyForwardingTarget)"

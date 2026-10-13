@@ -24,7 +24,7 @@ info:
     `X-ICLOUD-HME` 的 `p=`/`f=` 路由信息，再结合 `Delivered-To`、`X-Original-To`、
     `Original-Recipient` 和常见 Apple 原始收件人头恢复隐私邮箱归属；Apple 的 `f=` 可以是中间
     转发地址，不必与最终 `Delivered-To` 相同。若只在 `To/Cc` 留下隐私地址，必须显式启用弱收件人头才会匹配。
-    这些规则只控制邮件取件与归属；Apple 目录同步和自动创建仍使用现有的主号默认转发目标校验。
+    这些规则只控制邮件取件与归属；Apple 目录同步、自动创建和删除是否使用主号默认转发目标校验，由主号的“校验默认转发目标”开关控制，Apple 会话身份一致性校验始终保留。
 
     IMAPS 用户名是隐私邮箱地址。客户端可以使用本服务签发的 IMAP 密码登录，
     或通过 `POST /oauth2/v2.0/token` 获取一小时访问令牌后使用 XOAUTH2。

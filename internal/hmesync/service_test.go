@@ -2278,6 +2278,52 @@ func TestDeleteAliasRejectsTargetForwardedToAnotherMailbox(t *testing.T) {
 	}
 }
 
+func TestDeleteAliasForwardingVerificationOffAllowsTargetDelete(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.account.VerifyForwardingTarget = false
+	repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: true})
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{
+				SelectedForwardTo: "domain@example.com",
+				ForwardToEmails:   []string{"domain@example.com"},
+				Aliases: []apple.Alias{{
+					AnonymousID: "target-id", HME: "alias@icloud.com",
+					ForwardToEmail: "domain@example.com", IsActive: true,
+				}},
+			}, session, nil
+		},
+		deactivate: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+			if anonymousID != "target-id" {
+				t.Fatalf("deactivate anonymous ID = %q, want target-id", anonymousID)
+			}
+			return session, nil
+		},
+		deleteRemote: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+			if anonymousID != "target-id" {
+				t.Fatalf("delete anonymous ID = %q, want target-id", anonymousID)
+			}
+			return session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	if err := service.DeleteAlias(ctx, 41); err != nil {
+		t.Fatalf("delete with forwarding verification disabled: %v", err)
+	}
+	if repo.hasAlias(41) || repo.aliasDeletes.Load() != 1 ||
+		client.deactivateCalls.Load() != 1 || client.deleteCalls.Load() != 1 {
+		t.Fatalf("forwarding verification disabled did not delete: exists=%v local=%d deactivate=%d delete=%d",
+			repo.hasAlias(41), repo.aliasDeletes.Load(), client.deactivateCalls.Load(), client.deleteCalls.Load())
+	}
+}
+
 func TestDeleteAliasRequiresUsableAppleSession(t *testing.T) {
 	t.Run("login required", func(t *testing.T) {
 		now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
