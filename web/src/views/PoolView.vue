@@ -33,6 +33,23 @@
               <el-option v-for="p in purposes" :key="p" :label="purposeName(p)" :value="p" />
             </el-select>
             <el-select
+              v-model="memberAccountId"
+              placeholder="全部主号"
+              clearable
+              filterable
+              @change="
+                memberPage = 1;
+                loadMembers();
+              "
+            >
+              <el-option
+                v-for="account in mainAccounts"
+                :key="account.id"
+                :label="account.email"
+                :value="account.id"
+              />
+            </el-select>
+            <el-select
               v-model="memberState"
               placeholder="全部状态"
               clearable
@@ -74,7 +91,12 @@
             empty-text="暂无库存。新创建且确认成功的邮箱会自动入池；已有邮箱可手动加入。"
           >
             <el-table-column label="序号" width="64" align="center"><template #default="{ $index }">{{ (memberPage - 1) * 50 + $index + 1 }}</template></el-table-column>
-            <el-table-column prop="address" label="邮箱" min-width="245" />
+            <el-table-column label="邮箱" min-width="245">
+              <template #default="{ row }">
+                <div>{{ row.address }}</div>
+                <small v-if="row.account_email" class="pool-member-account">{{ row.account_email }}</small>
+              </template>
+            </el-table-column>
             <el-table-column label="用途" width="100"><template #default="{ row }">{{ purposeName(row.purpose) }}</template></el-table-column>
             <el-table-column prop="group_name" label="分组" min-width="110" />
             <el-table-column label="状态" width="135"
@@ -534,10 +556,12 @@ const tab = ref("members"),
 const members = ref({ items: [], total: 0 }),
   leases = ref({ items: [], total: 0 }),
   clients = ref([]),
-  accounts = ref([]);
+  accounts = ref([]),
+  mainAccounts = ref([]);
 const immediateUsed = ref(true);
 const memberState = ref(""),
   memberPurpose = ref("adobe"),
+  memberAccountId = ref(""),
   leaseState = ref(""),
   leasePurpose = ref("adobe"),
   search = ref(""),
@@ -647,6 +671,7 @@ async function loadMembers(signal) {
         query({
           state: memberState.value,
           purpose: memberPurpose.value,
+          account_id: memberAccountId.value,
           q: search.value,
           limit: 50,
           offset: (memberPage.value - 1) * 50,
@@ -687,7 +712,12 @@ async function refresh() {
       request("/pool/clients", "GET", undefined, controller.signal).then((result) => {
         if (ticket === poolRefreshTicket) clients.value = result;
       }),
-      activeTab === "members" ? loadMembers(controller.signal) :
+      activeTab === "members" ? Promise.all([
+        loadMembers(controller.signal),
+        getAllAccounts({ signal: controller.signal }).then((result) => {
+          if (ticket === poolRefreshTicket) mainAccounts.value = result;
+        }),
+      ]) :
         activeTab === "leases" ? loadLeases(controller.signal) :
           activeTab === "accounts" ? request("/pool/accounts", "GET", undefined, controller.signal).then((result) => {
             if (ticket === poolRefreshTicket) accounts.value = result;
@@ -993,6 +1023,12 @@ onMounted(refresh);
 .pool-toolbar .el-select,
 .pool-toolbar .el-input {
   width: 230px;
+}
+.pool-member-account {
+  display: block;
+  margin-top: 2px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 .pool-hint {
   line-height: 1.8;

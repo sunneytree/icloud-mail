@@ -231,4 +231,4 @@ release/commit/renew 仍按 lease ID 操作，无需另传 purpose，不会修�
 
 启动迁移仅执行一次：旧 used/retiring/retired 领取归到 adobe，其他旧记录归 common；没有领取记录的旧已用库存保留 adobe 使用标记。之后新产生的 common 记录不会在重启时再次迁走。
 
-管理库存 API `GET /admin/api/v1/pool/members?purpose=adobe` 按用途返回状态（默认 common）；领取列表可用 `purpose` 过滤。页面默认 Adobe，支持通用/GPT/自定义用途。暂停/恢复、主号停用、Apple 删除仍为全局；存在多个用途活动领取时禁止按单个领取删除 Apple 邮箱。自动补库存目标按全局无占用地址计算。
+管理库存 API `GET /admin/api/v1/pool/members?purpose=adobe&account_id=123` 按用途和可选主号返回状态（默认 common、空 account_id 表示全部主号）；每条成员同时返回 `account_email` 所属主号。领取列表可用 `purpose` 过滤。页面默认 Adobe，支持通用/GPT/自定义用途；邮箱库存页默认显示全部主号，可按主号筛选，并在邮箱地址下方展示所属主号。暂停/恢复、主号停用、Apple 删除仍为全局；存在多个用途活动领取时禁止按单个领取删除 Apple 邮箱。自动补库存目标按全局无占用地址计算。

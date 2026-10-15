@@ -305,6 +305,39 @@ func TestPoolNewOnlyEnrollmentAndPersistence(t *testing.T) {
 	}
 }
 
+func TestPoolMembersFilterByAccountAndIncludeOwner(t *testing.T) {
+	db, _, first, _, _ := poolFixture(t, 1, "")
+	ctx := context.Background()
+	second := createAccount(t, ctx, db, "second pool fixture", "pool-second-owner@icloud.com")
+	alias, err := db.CreateAlias(ctx, domain.Alias{AccountID: second.ID, Address: "pool-second@icloud.com", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnrollPoolAliases(ctx, []int64{alias.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := db.ListPoolMembersFiltered(ctx, 0, "", "", 50, 0)
+	if err != nil || all.Total != 2 || len(all.Items) != 2 {
+		t.Fatalf("all pool members: total=%d items=%d err=%v", all.Total, len(all.Items), err)
+	}
+	owners := map[string]bool{}
+	for _, item := range all.Items {
+		if item.AccountEmail == "" {
+			t.Fatalf("pool member %d has no owner email", item.AliasID)
+		}
+		owners[item.AccountEmail] = true
+	}
+	if !owners[first.Email] || !owners[second.Email] {
+		t.Fatalf("owner emails=%v", owners)
+	}
+
+	filtered, err := db.ListPoolMembersFiltered(ctx, second.ID, "", "", 50, 0)
+	if err != nil || filtered.Total != 1 || len(filtered.Items) != 1 || filtered.Items[0].AccountID != second.ID || filtered.Items[0].AccountEmail != second.Email {
+		t.Fatalf("account filter: %#v total=%d err=%v", filtered.Items, filtered.Total, err)
+	}
+}
+
 func TestPoolExpiryClosesDeletedAliasLease(t *testing.T) {
 	db, _, _, aliases, client := poolFixture(t, 1, "")
 	ctx := context.Background()

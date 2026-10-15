@@ -484,7 +484,15 @@ func (s *Server) adminSetPoolAccount(c *gin.Context) {
 
 func (s *Server) adminPoolMembers(c *gin.Context) {
 	limit, offset := poolPagination(c)
-	page, err := s.store.ListPoolMembers(c.Request.Context(), c.Query("state"), c.Query("q"), limit, offset, c.Query("purpose"))
+	accountID, ok := adminAPIOptionalPositiveInt64(c, "account_id")
+	if !ok {
+		return
+	}
+	filterAccountID := int64(0)
+	if accountID != nil {
+		filterAccountID = *accountID
+	}
+	page, err := s.store.ListPoolMembersFiltered(c.Request.Context(), filterAccountID, c.Query("state"), c.Query("q"), limit, offset, c.Query("purpose"))
 	if err != nil {
 		s.poolError(c, err)
 		return

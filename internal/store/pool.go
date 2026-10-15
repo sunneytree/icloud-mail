@@ -47,14 +47,15 @@ type PoolAccount struct {
 }
 
 type PoolMember struct {
-	Purpose   string    `json:"purpose"`
-	AliasID   int64     `json:"alias_id"`
-	AccountID int64     `json:"account_id"`
-	Address   string    `json:"address"`
-	GroupName string    `json:"group_name"`
-	State     string    `json:"state"`
-	Enabled   bool      `json:"enabled"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Purpose      string    `json:"purpose"`
+	AliasID      int64     `json:"alias_id"`
+	AccountID    int64     `json:"account_id"`
+	AccountEmail string    `json:"account_email"`
+	Address      string    `json:"address"`
+	GroupName    string    `json:"group_name"`
+	State        string    `json:"state"`
+	Enabled      bool      `json:"enabled"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type PoolLease struct {
@@ -486,6 +487,13 @@ func (s *Store) SetPoolMember(ctx context.Context, id int64, state string) error
 }
 
 func (s *Store) ListPoolMembers(ctx context.Context, state, search string, limit, offset int, purposes ...string) (PoolPage[PoolMember], error) {
+	return s.ListPoolMembersFiltered(ctx, 0, state, search, limit, offset, purposes...)
+}
+
+// ListPoolMembersFiltered lists pool members and optionally limits them to one
+// main account. AccountEmail is returned with every row so the inventory view
+// can identify which main account owns the hidden address.
+func (s *Store) ListPoolMembersFiltered(ctx context.Context, accountID int64, state, search string, limit, offset int, purposes ...string) (PoolPage[PoolMember], error) {
 	page := PoolPage[PoolMember]{Items: []PoolMember{}}
 	purpose := "common"
 	if len(purposes) > 0 {
@@ -498,12 +506,13 @@ func (s *Store) ListPoolMembers(ctx context.Context, state, search string, limit
 	effective := `CASE WHEN m.state='paused' THEN 'paused' ELSE COALESCE((SELECT l.state FROM pool_leases l WHERE l.alias_id=m.alias_id AND l.purpose=? AND l.state IN ('used','leased','retiring') LIMIT 1),(SELECT 'used' FROM pool_legacy_purpose_marks u WHERE u.alias_id=m.alias_id AND u.purpose=?),'available') END`
 
 	where := ` FROM pool_members m JOIN aliases al ON al.id=m.alias_id JOIN accounts a ON a.id=al.account_id
-	 LEFT JOIN mail_groups g ON g.id=al.group_id WHERE (?='' OR ` + effective + `=?) AND LOWER(al.address) LIKE ?`
-	args := []any{state, purpose, purpose, state, "%" + strings.ToLower(search) + "%"}
+	 LEFT JOIN mail_groups g ON g.id=al.group_id WHERE (?='' OR ` + effective + `=?) AND LOWER(al.address) LIKE ?
+	 AND (?=0 OR al.account_id=?)`
+	args := []any{state, purpose, purpose, state, "%" + strings.ToLower(search) + "%", accountID, accountID}
 	if err := s.queryRowContext(ctx, `SELECT COUNT(*)`+where, args...).Scan(&page.Total); err != nil {
 		return page, err
 	}
-	rows, err := s.queryContext(ctx, `SELECT al.id,al.account_id,al.address,COALESCE(g.name,''),`+effective+`,(al.enabled AND a.enabled),m.updated_at`+where+` ORDER BY al.id DESC LIMIT ? OFFSET ?`, append(append([]any{purpose, purpose}, args...), limit, offset)...)
+	rows, err := s.queryContext(ctx, `SELECT al.id,al.account_id,a.email,al.address,COALESCE(g.name,''),`+effective+`,(al.enabled AND a.enabled),m.updated_at`+where+` ORDER BY al.id DESC LIMIT ? OFFSET ?`, append(append([]any{purpose, purpose}, args...), limit, offset)...)
 	if err != nil {
 		return page, err
 	}
@@ -512,7 +521,7 @@ func (s *Store) ListPoolMembers(ctx context.Context, state, search string, limit
 		var v PoolMember
 		v.Purpose = purpose
 		var at int64
-		if err := rows.Scan(&v.AliasID, &v.AccountID, &v.Address, &v.GroupName, &v.State, &v.Enabled, &at); err != nil {
+		if err := rows.Scan(&v.AliasID, &v.AccountID, &v.AccountEmail, &v.Address, &v.GroupName, &v.State, &v.Enabled, &at); err != nil {
 			return page, err
 		}
 		v.UpdatedAt = time.Unix(0, at).UTC()
