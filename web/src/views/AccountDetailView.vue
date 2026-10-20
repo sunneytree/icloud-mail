@@ -78,9 +78,9 @@
           @submit.prevent="submitAppleVerification"
         >
           <p class="dialog-form__lead">
-            请在受信任的 Apple 设备上查看验证码。
+            {{ appleSmsState.sent ? `短信验证码已发送到 ${appleSmsState.phoneLabel}。` : "请在受信任的 Apple 设备上查看验证码；也可以改用短信验证码。" }}
           </p>
-          <el-form-item label="6 位验证码" prop="code">
+          <el-form-item :label="appleSmsState.sent ? '短信验证码' : '6 位验证码'" prop="code">
             <el-input
               v-model="appleVerificationForm.code"
               maxlength="6"
@@ -89,6 +89,30 @@
               placeholder="000000"
             />
           </el-form-item>
+          <div class="apple-sms-actions">
+            <el-select
+              v-if="appleSmsState.phones.length"
+              v-model="appleSmsState.phoneId"
+              class="apple-sms-phone-select"
+              placeholder="选择接收短信的手机号"
+              :disabled="appleSmsLoading || appleAuthLoading"
+            >
+              <el-option
+                v-for="phone in appleSmsState.phones"
+                :key="phone.id"
+                :label="phone.label"
+                :value="phone.id"
+              />
+            </el-select>
+            <el-button
+              native-type="button"
+              :loading="appleSmsLoading"
+              :disabled="appleAuthLoading || (appleSmsState.phones.length > 0 && !appleSmsState.phoneId)"
+              @click="requestAppleSms"
+            >
+              {{ appleSmsState.phones.length ? "发送到所选手机号" : (appleSmsState.sent ? "重新发送短信验证码" : "发送短信验证码") }}
+            </el-button>
+          </div>
         </el-form>
 
         <template #footer>
@@ -941,6 +965,7 @@ import {
   getAllAliases,
   getMailGroups,
   loginAppleSession,
+  requestAppleSmsCode,
   moveAliasToGroup as moveAliasToGroupRequest,
   rotateAlias,
   setAliasAutoCreation,
@@ -1033,6 +1058,7 @@ const aliasFormError = ref(null);
 const appleAuthVisible = ref(false);
 const appleAuthStep = ref("login");
 const appleAuthLoading = ref(false);
+const appleSmsLoading = ref(false);
 const appleAuthError = ref(null);
 const appleLoginFormRef = ref(null);
 const appleVerificationFormRef = ref(null);
@@ -1111,6 +1137,12 @@ const aliasForm = reactive({ address: "", label: "" });
 const appleLoginForm = reactive({ appleId: "", password: "", region: "global" });
 const appleVerificationForm = reactive({ code: "" });
 const appleAuthChallenge = reactive({ challengeId: "", flow: "" });
+const appleSmsState = reactive({
+  sent: false,
+  phoneId: 0,
+  phoneLabel: "",
+  phones: [],
+});
 const appleLoginRules = {
   appleId: [{ required: true, message: "请填写 Apple ID", trigger: "blur" }],
   password: [{ required: true, message: "请填写 Apple 账户密码", trigger: "blur" }],
@@ -1865,6 +1897,7 @@ function resetAppleAuthForm() {
   appleLoginForm.password = "";
   appleVerificationForm.code = "";
   Object.assign(appleAuthChallenge, { challengeId: "", flow: "" });
+  Object.assign(appleSmsState, { sent: false, phoneId: 0, phoneLabel: "", phones: [] });
 }
 
 function openAppleLogin({
@@ -1882,6 +1915,7 @@ function openAppleLogin({
   appleLoginForm.region = appleSession.value?.region || "global";
   appleVerificationForm.code = "";
   Object.assign(appleAuthChallenge, { challengeId: "", flow: "" });
+  Object.assign(appleSmsState, { sent: false, phoneId: 0, phoneLabel: "", phones: [] });
   appleAuthVisible.value = true;
   nextTick(() => appleLoginFormRef.value?.clearValidate());
 }
@@ -1909,6 +1943,7 @@ function returnToAppleLogin() {
   appleLoginForm.password = "";
   appleVerificationForm.code = "";
   Object.assign(appleAuthChallenge, { challengeId: "", flow: "" });
+  Object.assign(appleSmsState, { sent: false, phoneId: 0, phoneLabel: "", phones: [] });
   nextTick(() => appleLoginFormRef.value?.clearValidate());
 }
 
@@ -1971,6 +2006,7 @@ async function submitAppleLogin() {
         challengeId: result.challengeId,
         flow: result.flow,
       });
+      Object.assign(appleSmsState, { sent: false, phoneId: 0, phoneLabel: "", phones: [] });
       appleAuthStep.value = "verification";
       await nextTick();
       appleVerificationFormRef.value?.clearValidate();
@@ -1989,6 +2025,41 @@ async function submitAppleLogin() {
   }
 }
 
+async function requestAppleSms() {
+  if (appleSmsLoading.value || appleAuthLoading.value || !account.value) return;
+  const accountId = account.value.id;
+  appleSmsLoading.value = true;
+  appleAuthError.value = null;
+  try {
+    const result = await requestAppleSmsCode(
+      accountId,
+      {
+        challenge_id: appleAuthChallenge.challengeId,
+        phone_id: appleSmsState.phoneId || 0,
+      },
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return;
+    if (result.status === "phone_selection_required") {
+      appleSmsState.phones = result.phones || [];
+      appleSmsState.phoneId = 0;
+      appleSmsState.sent = false;
+      appleSmsState.phoneLabel = "";
+      return;
+    }
+    if (result.status !== "sms_sent" || !result.selectedPhone) {
+      throw new Error("Apple 未确认短信验证码已发送，请重试。");
+    }
+    appleSmsState.sent = true;
+    appleSmsState.phoneId = result.selectedPhone.id;
+    appleSmsState.phoneLabel = result.selectedPhone.label;
+  } catch (error) {
+    if (isCurrentAccount(accountId)) appleAuthError.value = error;
+  } finally {
+    appleSmsLoading.value = false;
+  }
+}
+
 async function submitAppleVerification() {
   if (appleAuthLoading.value || !account.value) return;
   const valid = await appleVerificationFormRef.value
@@ -2004,6 +2075,10 @@ async function submitAppleVerification() {
       challenge_id: appleAuthChallenge.challengeId,
       code: appleVerificationForm.code.trim(),
     };
+    if (appleSmsState.sent) {
+      verificationPayload.method = "sms";
+      verificationPayload.phone_id = appleSmsState.phoneId;
+    }
     if (appleAuthChallenge.flow) {
       verificationPayload.flow = appleAuthChallenge.flow;
     }
@@ -2798,6 +2873,19 @@ onBeforeUnmount(() => {
 
 .mobile-alias-group-select {
   min-width: 150px;
+}
+
+.apple-sms-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.apple-sms-phone-select {
+  min-width: 220px;
+  flex: 1 1 220px;
 }
 
 @media (max-width: 720px) {

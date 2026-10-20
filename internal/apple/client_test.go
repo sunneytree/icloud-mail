@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -307,6 +308,90 @@ func TestSignInVerifyAndListAliases(t *testing.T) {
 		if strings.Contains(requestBody, fixture.password) {
 			t.Fatal("plaintext password was sent over the SRP protocol")
 		}
+	}
+}
+
+func TestSMSFallbackUsesTrustedPhoneEndpoints(t *testing.T) {
+	var requests []string
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests = append(requests, request.Method+" "+request.URL.Path)
+		var body []byte
+		if request.Body != nil {
+			var err error
+			body, err = io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+		}
+		switch request.Method + " " + request.URL.Path {
+		case http.MethodGet + " /appleauth/auth":
+			return testResponse(request, http.StatusOK, `{"phoneNumberVerification":{"trustedPhoneNumbers":[{"id":7,"obfuscatedNumber":"+1 •••• 6789","lastTwoDigits":"89"}]}}`, nil), nil
+		case http.MethodPut + " /appleauth/auth/verify/phone":
+			var payload struct {
+				PhoneNumber struct {
+					ID int `json:"id"`
+				} `json:"phoneNumber"`
+				Mode string `json:"mode"`
+			}
+			if err := json.Unmarshal(body, &payload); err != nil || payload.PhoneNumber.ID != 7 || payload.Mode != "sms" {
+				return nil, fmt.Errorf("unexpected SMS request: %s", body)
+			}
+			return testResponse(request, http.StatusNoContent, "", nil), nil
+		case http.MethodPost + " /appleauth/auth/verify/phone/securitycode":
+			var payload struct {
+				SecurityCode struct {
+					Code string `json:"code"`
+				} `json:"securityCode"`
+				PhoneNumber struct {
+					ID int `json:"id"`
+				} `json:"phoneNumber"`
+				Mode string `json:"mode"`
+			}
+			if err := json.Unmarshal(body, &payload); err != nil || payload.SecurityCode.Code != "123456" || payload.PhoneNumber.ID != 7 || payload.Mode != "sms" {
+				return nil, fmt.Errorf("unexpected SMS verification: %s", body)
+			}
+			headers := make(http.Header)
+			headers.Set("X-Apple-Session-Token", "sms-session")
+			return testResponse(request, http.StatusConflict, "{}", headers), nil
+		case http.MethodGet + " /appleauth/auth/2sv/trust":
+			headers := make(http.Header)
+			headers.Set("X-Apple-TwoSV-Trust-Token", "sms-trust")
+			return testResponse(request, http.StatusNoContent, "", headers), nil
+		case http.MethodPost + " /setup/ws/1/accountLogin":
+			return testResponse(request, http.StatusOK, `{"dsInfo":{"dsid":42,"primaryEmail":"owner@example.com","countryCode":"US","hsaVersion":2,"isHideMyEmailSubscriptionActive":true},"hsaChallengeRequired":false,"hsaTrustedBrowser":true}`, nil), nil
+		default:
+			return nil, fmt.Errorf("unexpected SMS fallback request %s %s", request.Method, request.URL.Path)
+		}
+	})
+	client, err := NewClient(Config{Transport: transport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := Session{Region: RegionGlobal, FrameID: "frame", SessionID: "session", SCNT: "scnt", AuthAttributes: "attributes", SessionToken: "session-token"}
+	phones, session, err := client.ListTrustedPhones(context.Background(), session)
+	if err != nil || len(phones) != 1 || phones[0].ID != 7 {
+		t.Fatalf("trusted phones = %#v, err=%v", phones, err)
+	}
+	session, err = client.RequestSMSCode(context.Background(), session, phones[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err = client.VerifySMSCode(context.Background(), session, phones[0].ID, "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.DSID != "42" || session.TrustToken != "sms-trust" {
+		t.Fatalf("unexpected SMS session: %#v", session)
+	}
+	want := []string{
+		"GET /appleauth/auth",
+		"PUT /appleauth/auth/verify/phone",
+		"POST /appleauth/auth/verify/phone/securitycode",
+		"GET /appleauth/auth/2sv/trust",
+		"POST /setup/ws/1/accountLogin",
+	}
+	if !reflect.DeepEqual(requests, want) {
+		t.Fatalf("requests = %#v, want %#v", requests, want)
 	}
 }
 

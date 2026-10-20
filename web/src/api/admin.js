@@ -796,6 +796,40 @@ export async function verifyAppleSession(accountId, payload, csrfToken) {
   return appleSessionResult(data);
 }
 
+export async function requestAppleSmsCode(accountId, payload, csrfToken) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/apple-auth/sms`,
+    {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    },
+  );
+  const result = data?.data || data || {};
+  const phones = Array.isArray(result.phones)
+    ? result.phones
+    : Array.isArray(result.Phones)
+      ? result.Phones
+      : [];
+  const selected = result.selected_phone || result.selectedPhone || result.SelectedPhone || null;
+  return {
+    status: result.status || result.Status || "",
+    challengeId: result.challenge_id || result.challengeId || result.ChallengeID || "",
+    phones: phones.map((phone) => ({
+      id: phone.id ?? phone.ID,
+      label: phone.label || phone.Label || "受信任手机号",
+      lastFour: phone.last_four || phone.lastFour || phone.LastFour || "",
+    })),
+    selectedPhone: selected
+      ? {
+          id: selected.id ?? selected.ID,
+          label: selected.label || selected.Label || "受信任手机号",
+          lastFour: selected.last_four || selected.lastFour || selected.LastFour || "",
+        }
+      : null,
+  };
+}
+
 export function deleteAppleSession(accountId, csrfToken) {
   return apiRequest(
     `/accounts/${encodeURIComponent(accountId)}/apple-auth`,

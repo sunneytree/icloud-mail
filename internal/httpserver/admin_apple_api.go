@@ -26,6 +26,11 @@ type HMESyncService interface {
 	DeleteAlias(context.Context, int64) error
 }
 
+type hmeSMSAuthService interface {
+	RequestSMSAuth(context.Context, int64, int64, string, int) (hmesync.SMSAuthResult, error)
+	VerifySMSAuth(context.Context, int64, int64, string, int, string) (hmesync.AuthResult, error)
+}
+
 // HMEBatchDeletionService is optional so existing embedders that implement
 // HMESyncService remain source-compatible. The production HME service
 // implements it and reports each item's result independently.
@@ -42,6 +47,13 @@ type adminAPIAppleAuthRequest struct {
 type adminAPIAppleVerifyRequest struct {
 	ChallengeID string `json:"challenge_id"`
 	Code        string `json:"code"`
+	Method      string `json:"method"`
+	PhoneID     int    `json:"phone_id"`
+}
+
+type adminAPIAppleSMSRequest struct {
+	ChallengeID string `json:"challenge_id"`
+	PhoneID     int    `json:"phone_id"`
 }
 
 type adminAPIAppleSessionDTO struct {
@@ -56,6 +68,19 @@ type adminAPIAppleAuthResultDTO struct {
 	Status       string                   `json:"status"`
 	ChallengeID  string                   `json:"challenge_id,omitempty"`
 	AppleSession *adminAPIAppleSessionDTO `json:"apple_session"`
+}
+
+type adminAPIAppleSMSPhoneDTO struct {
+	ID       int    `json:"id"`
+	Label    string `json:"label"`
+	LastFour string `json:"last_four,omitempty"`
+}
+
+type adminAPIAppleSMSResultDTO struct {
+	Status        string                     `json:"status"`
+	ChallengeID   string                     `json:"challenge_id"`
+	Phones        []adminAPIAppleSMSPhoneDTO `json:"phones,omitempty"`
+	SelectedPhone *adminAPIAppleSMSPhoneDTO  `json:"selected_phone,omitempty"`
 }
 
 type adminAPIAppleSyncSummaryDTO struct {
@@ -140,8 +165,17 @@ func (s *Server) adminAPIVerifyAppleAuth(c *gin.Context) {
 	}
 	input.ChallengeID = strings.TrimSpace(input.ChallengeID)
 	input.Code = strings.TrimSpace(input.Code)
+	input.Method = strings.ToLower(strings.TrimSpace(input.Method))
 	if input.ChallengeID == "" || len(input.ChallengeID) > 256 || !adminAPISixDigitCode(input.Code) {
 		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "验证码请求信息无效")
+		return
+	}
+	if input.Method != "" && input.Method != "trusted_device" && input.Method != "sms" {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "验证码方式无效")
+		return
+	}
+	if input.Method == "sms" && input.PhoneID < 1 {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "短信验证码手机号无效")
 		return
 	}
 
@@ -150,22 +184,67 @@ func (s *Server) adminAPIVerifyAppleAuth(c *gin.Context) {
 		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "apple_auth_verify", adminAPIAppleServiceUnavailable())
 		return
 	}
-	result, err := s.hmeSync.VerifyAuth(
-		c.Request.Context(), adminSession.AdminID, accountID,
-		input.ChallengeID, input.Code,
-	)
+	var result hmesync.AuthResult
+	var err error
+	auditAction := "apple_auth_verify"
+	if input.Method == "sms" {
+		service, ok := s.hmeSync.(hmeSMSAuthService)
+		if !ok || input.PhoneID < 1 {
+			s.adminAPIFinishAppleFailure(c, adminSession, accountID, "apple_auth_verify_sms", adminAPIAppleServiceUnavailable())
+			return
+		}
+		result, err = service.VerifySMSAuth(c.Request.Context(), adminSession.AdminID, accountID, input.ChallengeID, input.PhoneID, input.Code)
+		auditAction = "apple_auth_verify_sms"
+	} else if input.Method == "" || input.Method == "trusted_device" {
+		result, err = s.hmeSync.VerifyAuth(
+			c.Request.Context(), adminSession.AdminID, accountID,
+			input.ChallengeID, input.Code,
+		)
+	} else {
+		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "apple_auth_verify", adminAPIAppleServiceUnavailable())
+		return
+	}
 	input.Code = ""
 	if err != nil {
-		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "apple_auth_verify", classifyAdminAPIAppleError(err))
+		s.adminAPIFinishAppleFailure(c, adminSession, accountID, auditAction, classifyAdminAPIAppleError(err))
 		return
 	}
 	status, valid := adminAPIAppleAuthHTTPStatus(result)
 	if !valid || result.Status != hmesync.StatusAuthenticated {
-		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "apple_auth_verify", adminAPIAppleServiceUnavailable())
+		s.adminAPIFinishAppleFailure(c, adminSession, accountID, auditAction, adminAPIAppleServiceUnavailable())
 		return
 	}
-	s.audit(c, &adminSession.AdminID, adminSession.Username, "apple_auth_verify", "account", strconv.FormatInt(accountID, 10), "success", result.Status)
+	s.audit(c, &adminSession.AdminID, adminSession.Username, auditAction, "account", strconv.FormatInt(accountID, 10), "success", result.Status)
 	writeAdminAPIData(c, status, adminAPIAppleAuthResult(result))
+}
+
+func (s *Server) adminAPIRequestAppleSMS(c *gin.Context) {
+	accountID, ok := adminAPIParseID(c)
+	if !ok || !s.adminAPIAppleAccountExists(c, accountID) {
+		return
+	}
+	var input adminAPIAppleSMSRequest
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	input.ChallengeID = strings.TrimSpace(input.ChallengeID)
+	if input.ChallengeID == "" || len(input.ChallengeID) > 256 || input.PhoneID < 0 {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "短信验证码请求信息无效")
+		return
+	}
+	adminSession := mustSession(c)
+	service, ok := s.hmeSync.(hmeSMSAuthService)
+	if !ok {
+		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "apple_auth_sms_request", adminAPIAppleServiceUnavailable())
+		return
+	}
+	result, err := service.RequestSMSAuth(c.Request.Context(), adminSession.AdminID, accountID, input.ChallengeID, input.PhoneID)
+	if err != nil {
+		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "apple_auth_sms_request", classifyAdminAPIAppleError(err))
+		return
+	}
+	s.audit(c, &adminSession.AdminID, adminSession.Username, "apple_auth_sms_request", "account", strconv.FormatInt(accountID, 10), "success", result.Status)
+	writeAdminAPIData(c, http.StatusOK, adminAPIAppleSMSResult(result))
 }
 
 func (s *Server) adminAPIClearAppleAuth(c *gin.Context) {
@@ -288,6 +367,22 @@ func adminAPIAppleAuthResult(result hmesync.AuthResult) adminAPIAppleAuthResultD
 		ChallengeID:  result.ChallengeID,
 		AppleSession: adminAPIAppleSessionFromInfo(result.Session),
 	}
+}
+
+func adminAPIAppleSMSResult(result hmesync.SMSAuthResult) adminAPIAppleSMSResultDTO {
+	response := adminAPIAppleSMSResultDTO{
+		Status:      result.Status,
+		ChallengeID: result.ChallengeID,
+		Phones:      make([]adminAPIAppleSMSPhoneDTO, 0, len(result.Phones)),
+	}
+	for _, phone := range result.Phones {
+		response.Phones = append(response.Phones, adminAPIAppleSMSPhoneDTO{ID: phone.ID, Label: phone.Label, LastFour: phone.LastFour})
+	}
+	if result.SelectedPhone != nil {
+		selected := adminAPIAppleSMSPhoneDTO{ID: result.SelectedPhone.ID, Label: result.SelectedPhone.Label, LastFour: result.SelectedPhone.LastFour}
+		response.SelectedPhone = &selected
+	}
+	return response
 }
 
 func adminAPIAppleAuthHTTPStatus(result hmesync.AuthResult) (int, bool) {

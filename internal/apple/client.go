@@ -277,6 +277,124 @@ func (c *Client) VerifyCode(ctx context.Context, session Session, code string) (
 	return result, nil
 }
 
+// ListTrustedPhones returns the trusted phone numbers available for the
+// current two-factor challenge. It only reads the pending authentication
+// state; it does not send a code.
+func (c *Client) ListTrustedPhones(ctx context.Context, session Session) (phones []TrustedPhone, result Session, err error) {
+	result = session
+	op, err := c.newOperation(&result)
+	if err != nil {
+		return nil, result, err
+	}
+	defer op.persist(&result)
+	response, err := op.request(ctx, "list trusted phone numbers", http.MethodGet, op.endpoints.Auth, nil, op.authHeaders())
+	if err != nil {
+		return nil, result, err
+	}
+	if response.status != http.StatusOK {
+		return nil, result, response.operationError("list trusted phone numbers", ErrService, nil)
+	}
+	var body struct {
+		PhoneNumberVerification struct {
+			TrustedPhoneNumbers []TrustedPhone `json:"trustedPhoneNumbers"`
+		} `json:"phoneNumberVerification"`
+		TrustedPhoneNumbers []TrustedPhone `json:"trustedPhoneNumbers"`
+	}
+	if err := json.Unmarshal(response.body, &body); err != nil {
+		return nil, result, response.operationError("decode trusted phone numbers", ErrInvalidResponse, err)
+	}
+	phones = body.PhoneNumberVerification.TrustedPhoneNumbers
+	if len(phones) == 0 {
+		phones = body.TrustedPhoneNumbers
+	}
+	valid := phones[:0]
+	for _, phone := range phones {
+		if phone.ID > 0 {
+			valid = append(valid, phone)
+		}
+	}
+	return valid, result, nil
+}
+
+// RequestSMSCode asks Apple to send a two-factor code to a selected trusted
+// phone. The session may receive rotated authentication headers/cookies.
+func (c *Client) RequestSMSCode(ctx context.Context, session Session, phoneID int) (result Session, err error) {
+	result = session
+	if phoneID < 1 {
+		return result, operationError("request SMS two-factor code", ErrTwoFactorCode, 0, errors.New("trusted phone ID is required"))
+	}
+	op, err := c.newOperation(&result)
+	if err != nil {
+		return result, err
+	}
+	defer op.persist(&result)
+	response, err := op.request(ctx, "request SMS two-factor code", http.MethodPut, op.endpoints.Auth+"/verify/phone", map[string]any{
+		"phoneNumber": map[string]int{"id": phoneID},
+		"mode":        "sms",
+	}, op.authHeaders())
+	if err != nil {
+		return result, err
+	}
+	if response.status != http.StatusOK && response.status != http.StatusNoContent {
+		kind := ErrService
+		if response.status == http.StatusBadRequest || response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == http.StatusConflict {
+			kind = ErrTwoFactorCode
+		}
+		return result, response.operationError("request SMS two-factor code", kind, nil)
+	}
+	return result, nil
+}
+
+// VerifySMSCode verifies a code sent to a trusted phone and completes the
+// same trust/account-session exchange as the trusted-device flow.
+func (c *Client) VerifySMSCode(ctx context.Context, session Session, phoneID int, code string) (result Session, err error) {
+	result = session
+	if phoneID < 1 || !validSecurityCode(code) {
+		return result, operationError("verify SMS two-factor code", ErrTwoFactorCode, 0, nil)
+	}
+	op, err := c.newOperation(&result)
+	if err != nil {
+		return result, err
+	}
+	defer op.persist(&result)
+	response, err := op.request(ctx, "verify SMS two-factor code", http.MethodPost, op.endpoints.Auth+"/verify/phone/securitycode", map[string]any{
+		"securityCode": map[string]string{"code": code},
+		"phoneNumber":  map[string]int{"id": phoneID},
+		"mode":         "sms",
+	}, op.authHeaders())
+	if err != nil {
+		return result, err
+	}
+	acceptedConflict := response.status == http.StatusConflict && response.header.Get("X-Apple-Session-Token") != ""
+	if response.status != http.StatusOK && response.status != http.StatusNoContent && !acceptedConflict {
+		kind := ErrService
+		if response.status == http.StatusBadRequest || response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == http.StatusConflict || response.status == http.StatusUnprocessableEntity {
+			kind = ErrTwoFactorCode
+		}
+		return result, &Error{
+			Op:          "verify SMS two-factor code",
+			Kind:        kind,
+			StatusCode:  response.status,
+			ServiceCode: responseServiceCode(response.body),
+			Retryable:   response.status == http.StatusTooManyRequests || response.status >= 500,
+			RetryAfter:  parseRetryAfter(response.header.Get("Retry-After"), time.Now()),
+		}
+	}
+	if err := op.trust(ctx); err != nil {
+		return result, err
+	}
+	account, err := op.accountLogin(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.applyAccount(account)
+	result.ValidatedAt = time.Now().UTC()
+	if requiresTwoFactor(result) {
+		return result, operationError("complete SMS two-factor authentication", ErrTwoFactorCode, 0, nil)
+	}
+	return result, nil
+}
+
 // Validate checks a persisted web session, exchanging its trusted token once
 // on HTTP 421 without triggering a fresh sign-in.
 func (c *Client) Validate(ctx context.Context, session Session) (result Session, err error) {

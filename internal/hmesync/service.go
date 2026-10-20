@@ -76,6 +76,8 @@ type challenge struct {
 	session      apple.Session
 	expiresAt    time.Time
 	attempts     int
+	smsPhoneID   int
+	smsSent      bool
 }
 
 type accountIdentity struct {
@@ -241,6 +243,146 @@ func (s *Service) VerifyAuth(
 	}
 
 	session, err := s.client.VerifyCode(ctx, flow.session, code)
+	code = ""
+	if err != nil {
+		mapped := mapAppleError(err, true)
+		if errors.Is(mapped, ErrVerificationInvalid) {
+			s.recordFailedAttempt(flow)
+		} else {
+			s.deleteChallenge(challengeID)
+		}
+		return AuthResult{}, mapped
+	}
+	normalizeSession(&session, flow.appleID, flow.region, s.now())
+	if err := s.attachManagementForWebLogin(ctx, accountID, &session); err != nil {
+		return AuthResult{}, err
+	}
+	record, err := s.persistSession(ctx, accountID, flow.identity, session)
+	if err != nil {
+		s.deleteChallenge(challengeID)
+		return AuthResult{}, err
+	}
+	s.deleteChallenge(challengeID)
+	info := sessionInfoFromRecord(record, session, StatusAuthenticated)
+	return AuthResult{Status: StatusAuthenticated, Session: info}, nil
+}
+
+// RequestSMSAuth switches an existing directory-login challenge to Apple's
+// trusted-phone SMS path. With multiple trusted phones it first returns a
+// masked choice list; the selected ID is then sent back to this method.
+func (s *Service) RequestSMSAuth(
+	ctx context.Context,
+	ownerAdminID, accountID int64,
+	challengeID string,
+	phoneID int,
+) (SMSAuthResult, error) {
+	if ownerAdminID < 1 || accountID < 1 {
+		return SMSAuthResult{}, errors.New("owner and account IDs must be positive")
+	}
+	challengeID = strings.TrimSpace(challengeID)
+	if challengeID == "" || phoneID < 0 {
+		return SMSAuthResult{}, wrapError(CodeFlowExpired, ErrFlowExpired, nil)
+	}
+	release, err := s.acquireOperation(ctx, accountID)
+	if err != nil {
+		return SMSAuthResult{}, err
+	}
+	defer release()
+	flow, ok := s.readChallenge(challengeID, ownerAdminID, accountID)
+	if !ok {
+		return SMSAuthResult{}, wrapError(CodeFlowExpired, ErrFlowExpired, nil)
+	}
+	account, err := s.repo.GetAccount(ctx, accountID)
+	if err != nil {
+		return SMSAuthResult{}, err
+	}
+	if !sameIdentity(identityOf(account), flow.identity) {
+		return SMSAuthResult{}, wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+	}
+	client, ok := s.client.(SMSAuthClient)
+	if !ok {
+		return SMSAuthResult{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("SMS fallback is unavailable"))
+	}
+	phones, session, err := client.ListTrustedPhones(ctx, flow.session)
+	if err != nil {
+		return SMSAuthResult{}, mapAppleError(err, false)
+	}
+	flow.session = session
+	choices := smsPhoneChoices(phones)
+	if len(choices) == 0 {
+		return SMSAuthResult{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("Apple account has no trusted phone numbers"))
+	}
+	// Keep any session headers/cookies Apple rotated while listing phones,
+	// including when the UI needs to ask the user to choose one.
+	s.updateChallenge(flow)
+	if phoneID == 0 {
+		if len(choices) != 1 {
+			return SMSAuthResult{Status: StatusSMSPhoneSelectionRequired, ChallengeID: challengeID, Phones: choices}, nil
+		}
+		phoneID = choices[0].ID
+	}
+	var selected *SMSPhone
+	for index := range choices {
+		if choices[index].ID == phoneID {
+			selected = &choices[index]
+			break
+		}
+	}
+	if selected == nil {
+		return SMSAuthResult{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("trusted phone selection is invalid"))
+	}
+	updated, err := client.RequestSMSCode(ctx, flow.session, phoneID)
+	if err != nil {
+		return SMSAuthResult{}, mapAppleError(err, false)
+	}
+	flow.session = updated
+	flow.smsPhoneID = phoneID
+	flow.smsSent = true
+	s.updateChallenge(flow)
+	return SMSAuthResult{Status: StatusSMSSent, ChallengeID: challengeID, SelectedPhone: selected}, nil
+}
+
+// VerifySMSAuth completes the same directory session publication as the
+// trusted-device flow, using the SMS code requested for this challenge.
+func (s *Service) VerifySMSAuth(
+	ctx context.Context,
+	ownerAdminID, accountID int64,
+	challengeID string,
+	phoneID int,
+	code string,
+) (AuthResult, error) {
+	if ownerAdminID < 1 || accountID < 1 {
+		return AuthResult{}, errors.New("owner and account IDs must be positive")
+	}
+	challengeID = strings.TrimSpace(challengeID)
+	code = strings.TrimSpace(code)
+	if challengeID == "" || phoneID < 1 || code == "" {
+		return AuthResult{}, wrapError(CodeFlowExpired, ErrFlowExpired, nil)
+	}
+	release, err := s.acquireOperation(ctx, accountID)
+	if err != nil {
+		return AuthResult{}, err
+	}
+	defer release()
+	defer func() { code = "" }()
+	flow, ok := s.readChallenge(challengeID, ownerAdminID, accountID)
+	if !ok || !flow.smsSent || flow.smsPhoneID != phoneID {
+		return AuthResult{}, wrapError(CodeFlowExpired, ErrFlowExpired, nil)
+	}
+	account, err := s.repo.GetAccount(ctx, accountID)
+	if err != nil {
+		s.deleteChallenge(challengeID)
+		return AuthResult{}, err
+	}
+	if !sameIdentity(identityOf(account), flow.identity) {
+		s.deleteChallenge(challengeID)
+		return AuthResult{}, wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+	}
+	client, ok := s.client.(SMSAuthClient)
+	if !ok {
+		return AuthResult{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("SMS fallback is unavailable"))
+	}
+	session, err := client.VerifySMSCode(ctx, flow.session, phoneID, code)
 	code = ""
 	if err != nil {
 		mapped := mapAppleError(err, true)
@@ -1879,6 +2021,62 @@ func (s *Service) recordFailedAttempt(flow challenge) {
 		return
 	}
 	s.challenges[current.id] = current
+}
+
+func (s *Service) updateChallenge(flow challenge) {
+	s.challengeMu.Lock()
+	defer s.challengeMu.Unlock()
+	if current, ok := s.challenges[flow.id]; ok && current.ownerAdminID == flow.ownerAdminID && current.accountID == flow.accountID {
+		s.challenges[flow.id] = flow
+	}
+}
+
+func smsPhoneChoices(phones []apple.TrustedPhone) []SMSPhone {
+	choices := make([]SMSPhone, 0, len(phones))
+	seen := make(map[int]struct{}, len(phones))
+	for _, phone := range phones {
+		if phone.ID < 1 {
+			continue
+		}
+		if _, exists := seen[phone.ID]; exists {
+			continue
+		}
+		seen[phone.ID] = struct{}{}
+		label := strings.TrimSpace(phone.ObfuscatedNumber)
+		if label == "" {
+			label = maskedPhoneLabel(phone.NumberWithDialCode)
+		}
+		lastFour := strings.TrimSpace(phone.LastTwoDigits)
+		if label == "" && lastFour != "" {
+			label = "手机号末两位 " + lastFour
+		}
+		if label == "" {
+			label = "受信任手机号"
+		}
+		choices = append(choices, SMSPhone{ID: phone.ID, Label: label, LastFour: lastFour})
+	}
+	return choices
+}
+
+func maskedPhoneLabel(number string) string {
+	number = strings.TrimSpace(number)
+	if number == "" {
+		return ""
+	}
+	digits := make([]byte, 0, len(number))
+	for index := 0; index < len(number); index++ {
+		if number[index] >= '0' && number[index] <= '9' {
+			digits = append(digits, number[index])
+		}
+	}
+	if len(digits) == 0 {
+		return "受信任手机号"
+	}
+	keep := 4
+	if len(digits) < keep {
+		keep = len(digits)
+	}
+	return "手机号末四位 " + string(digits[len(digits)-keep:])
 }
 
 func (s *Service) deleteChallenge(id string) {

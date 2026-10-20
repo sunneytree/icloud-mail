@@ -72,6 +72,7 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.POST("/accounts/:id/sync", s.adminAPISyncAccount)
 	protected.PUT("/accounts/:id/mail-transport", s.adminAPISetMailTransport)
 	protected.POST("/accounts/:id/apple-auth", s.adminAPIStartAppleAuth)
+	protected.POST("/accounts/:id/apple-auth/sms", s.adminAPIRequestAppleSMS)
 	protected.POST("/accounts/:id/apple-auth/verify", s.adminAPIVerifyAppleAuth)
 	protected.DELETE("/accounts/:id/apple-auth", s.adminAPIClearAppleAuth)
 	protected.PUT("/accounts/:id/aliases/auto-create", s.adminAPISetAliasAutoCreation)

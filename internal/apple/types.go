@@ -109,6 +109,16 @@ type ListResult struct {
 	ForwardToEmails   []string `json:"forwardToEmails"`
 }
 
+// TrustedPhone is a phone number Apple allows as a two-factor fallback.
+// NumberWithDialCode is kept only for the short-lived login challenge; callers
+// should display ObfuscatedNumber or LastTwoDigits instead.
+type TrustedPhone struct {
+	ID                 int    `json:"id"`
+	NumberWithDialCode string `json:"numberWithDialCode,omitempty"`
+	ObfuscatedNumber   string `json:"obfuscatedNumber,omitempty"`
+	LastTwoDigits      string `json:"lastTwoDigits,omitempty"`
+}
+
 type accountResponse struct {
 	Success              *bool                 `json:"success,omitempty"`
 	DSInfo               dsInfo                `json:"dsInfo"`

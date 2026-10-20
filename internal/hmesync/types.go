@@ -144,6 +144,34 @@ type AuthResult struct {
 	Session     SessionInfo
 }
 
+const (
+	StatusSMSPhoneSelectionRequired = "phone_selection_required"
+	StatusSMSSent                   = "sms_sent"
+)
+
+// SMSPhone is a masked trusted phone choice exposed while a login challenge
+// is pending. The full phone number never leaves the Apple client.
+type SMSPhone struct {
+	ID       int
+	Label    string
+	LastFour string
+}
+
+type SMSAuthResult struct {
+	Status        string
+	ChallengeID   string
+	Phones        []SMSPhone
+	SelectedPhone *SMSPhone
+}
+
+// SMSAuthClient is optional so existing AppleClient adapters keep working.
+// The production Apple client implements the three methods below.
+type SMSAuthClient interface {
+	ListTrustedPhones(context.Context, apple.Session) ([]apple.TrustedPhone, apple.Session, error)
+	RequestSMSCode(context.Context, apple.Session, int) (apple.Session, error)
+	VerifySMSCode(context.Context, apple.Session, int, string) (apple.Session, error)
+}
+
 type SyncSummary struct {
 	Total                 int
 	CreatedCount          int
