@@ -325,7 +325,7 @@ func TestSMSFallbackUsesTrustedPhoneEndpoints(t *testing.T) {
 		}
 		switch request.Method + " " + request.URL.Path {
 		case http.MethodGet + " /appleauth/auth":
-			return testResponse(request, http.StatusOK, `{"phoneNumberVerification":{"trustedPhoneNumbers":[{"id":7,"obfuscatedNumber":"+1 •••• 6789","lastTwoDigits":"89"}]}}`, nil), nil
+			return testResponse(request, http.StatusCreated, `{"phoneNumberVerification":{"trustedPhoneNumbers":[{"id":7,"obfuscatedNumber":"+1 •••• 6789","lastTwoDigits":"89"}]}}`, nil), nil
 		case http.MethodPut + " /appleauth/auth/verify/phone":
 			var payload struct {
 				PhoneNumber struct {

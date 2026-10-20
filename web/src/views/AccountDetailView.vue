@@ -108,7 +108,7 @@
               native-type="button"
               :loading="appleSmsLoading"
               :disabled="appleAuthLoading || (appleSmsState.phones.length > 0 && !appleSmsState.phoneId)"
-              @click="requestAppleSms"
+              @click.stop.prevent="requestAppleSms"
             >
               {{ appleSmsState.phones.length ? "发送到所选手机号" : (appleSmsState.sent ? "重新发送短信验证码" : "发送短信验证码") }}
             </el-button>
@@ -2027,6 +2027,7 @@ async function submitAppleLogin() {
 
 async function requestAppleSms() {
   if (appleSmsLoading.value || appleAuthLoading.value || !account.value) return;
+  appleVerificationFormRef.value?.clearValidate("code");
   const accountId = account.value.id;
   appleSmsLoading.value = true;
   appleAuthError.value = null;

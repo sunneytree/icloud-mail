@@ -291,7 +291,7 @@ func (c *Client) ListTrustedPhones(ctx context.Context, session Session) (phones
 	if err != nil {
 		return nil, result, err
 	}
-	if response.status != http.StatusOK {
+	if response.status < http.StatusOK || response.status >= http.StatusMultipleChoices {
 		return nil, result, response.operationError("list trusted phone numbers", ErrService, nil)
 	}
 	var body struct {
@@ -335,7 +335,7 @@ func (c *Client) RequestSMSCode(ctx context.Context, session Session, phoneID in
 	if err != nil {
 		return result, err
 	}
-	if response.status != http.StatusOK && response.status != http.StatusNoContent {
+	if response.status < http.StatusOK || response.status >= http.StatusMultipleChoices {
 		kind := ErrService
 		if response.status == http.StatusBadRequest || response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == http.StatusConflict {
 			kind = ErrTwoFactorCode
@@ -366,7 +366,7 @@ func (c *Client) VerifySMSCode(ctx context.Context, session Session, phoneID int
 		return result, err
 	}
 	acceptedConflict := response.status == http.StatusConflict && response.header.Get("X-Apple-Session-Token") != ""
-	if response.status != http.StatusOK && response.status != http.StatusNoContent && !acceptedConflict {
+	if (response.status < http.StatusOK || response.status >= http.StatusMultipleChoices) && !acceptedConflict {
 		kind := ErrService
 		if response.status == http.StatusBadRequest || response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == http.StatusConflict || response.status == http.StatusUnprocessableEntity {
 			kind = ErrTwoFactorCode
