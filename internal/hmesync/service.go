@@ -303,9 +303,23 @@ func (s *Service) RequestSMSAuth(
 	if !ok {
 		return SMSAuthResult{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("SMS fallback is unavailable"))
 	}
-	phones, session, err := client.ListTrustedPhones(ctx, flow.session)
-	if err != nil {
-		return SMSAuthResult{}, mapAppleError(err, false)
+	var phones []apple.TrustedPhone
+	autoSent := false
+	var session apple.Session
+	if statusClient, ok := s.client.(SMSAuthClientWithDelivery); ok {
+		listed, updated, listErr := statusClient.ListTrustedPhonesWithStatus(ctx, flow.session)
+		if listErr != nil {
+			return SMSAuthResult{}, mapAppleError(listErr, false)
+		}
+		phones = listed.Phones
+		autoSent = listed.SMSAlreadySent
+		session = updated
+	} else {
+		var listErr error
+		phones, session, listErr = client.ListTrustedPhones(ctx, flow.session)
+		if listErr != nil {
+			return SMSAuthResult{}, mapAppleError(listErr, false)
+		}
 	}
 	flow.session = session
 	choices := smsPhoneChoices(phones)
@@ -315,6 +329,19 @@ func (s *Service) RequestSMSAuth(
 	// Keep any session headers/cookies Apple rotated while listing phones,
 	// including when the UI needs to ask the user to choose one.
 	s.updateChallenge(flow)
+	if autoSent {
+		// Apple HTTP 201 means the first trusted phone already received the
+		// code. Do not issue a second PUT, which invalidates that code.
+		if phoneID == 0 {
+			phoneID = choices[0].ID
+		}
+		if phoneID == choices[0].ID {
+			flow.smsPhoneID = phoneID
+			flow.smsSent = true
+			s.updateChallenge(flow)
+			return SMSAuthResult{Status: StatusSMSSent, ChallengeID: challengeID, SelectedPhone: &choices[0]}, nil
+		}
+	}
 	if phoneID == 0 {
 		if len(choices) != 1 {
 			return SMSAuthResult{Status: StatusSMSPhoneSelectionRequired, ChallengeID: challengeID, Phones: choices}, nil

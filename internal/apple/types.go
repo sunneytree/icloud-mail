@@ -119,6 +119,14 @@ type TrustedPhone struct {
 	LastTwoDigits      string `json:"lastTwoDigits,omitempty"`
 }
 
+// TrustedPhonesResult records whether Apple's phone-discovery response
+// already dispatched an SMS. Apple uses HTTP 201 for that automatic-send
+// branch; callers must not issue a second /verify/phone request in that case.
+type TrustedPhonesResult struct {
+	Phones         []TrustedPhone
+	SMSAlreadySent bool
+}
+
 type accountResponse struct {
 	Success              *bool                 `json:"success,omitempty"`
 	DSInfo               dsInfo                `json:"dsInfo"`

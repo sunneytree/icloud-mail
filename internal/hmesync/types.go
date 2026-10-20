@@ -172,6 +172,13 @@ type SMSAuthClient interface {
 	VerifySMSCode(context.Context, apple.Session, int, string) (apple.Session, error)
 }
 
+// SMSAuthClientWithDelivery preserves the Apple HTTP 201 side effect: the
+// phone-discovery response itself may already have sent the SMS.
+type SMSAuthClientWithDelivery interface {
+	SMSAuthClient
+	ListTrustedPhonesWithStatus(context.Context, apple.Session) (apple.TrustedPhonesResult, apple.Session, error)
+}
+
 type SyncSummary struct {
 	Total                 int
 	CreatedCount          int

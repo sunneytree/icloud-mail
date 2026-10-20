@@ -278,21 +278,33 @@ func (c *Client) VerifyCode(ctx context.Context, session Session, code string) (
 }
 
 // ListTrustedPhones returns the trusted phone numbers available for the
-// current two-factor challenge. It only reads the pending authentication
-// state; it does not send a code.
+// current two-factor challenge. Call ListTrustedPhonesWithStatus when the
+// caller must distinguish Apple's HTTP 201 auto-SMS response.
 func (c *Client) ListTrustedPhones(ctx context.Context, session Session) (phones []TrustedPhone, result Session, err error) {
+	listed, result, err := c.listTrustedPhones(ctx, session)
+	return listed.Phones, result, err
+}
+
+// ListTrustedPhonesWithStatus is the status-aware form used by the SMS
+// fallback. HTTP 201 from Apple's GET /auth means the first trusted phone has
+// already received a code, so a second PUT /verify/phone must be skipped.
+func (c *Client) ListTrustedPhonesWithStatus(ctx context.Context, session Session) (listed TrustedPhonesResult, result Session, err error) {
+	return c.listTrustedPhones(ctx, session)
+}
+
+func (c *Client) listTrustedPhones(ctx context.Context, session Session) (listed TrustedPhonesResult, result Session, err error) {
 	result = session
 	op, err := c.newOperation(&result)
 	if err != nil {
-		return nil, result, err
+		return listed, result, err
 	}
 	defer op.persist(&result)
 	response, err := op.request(ctx, "list trusted phone numbers", http.MethodGet, op.endpoints.Auth, nil, op.authHeaders())
 	if err != nil {
-		return nil, result, err
+		return listed, result, err
 	}
 	if response.status < http.StatusOK || response.status >= http.StatusMultipleChoices {
-		return nil, result, response.operationError("list trusted phone numbers", ErrService, nil)
+		return listed, result, response.operationError("list trusted phone numbers", ErrService, nil)
 	}
 	var body struct {
 		PhoneNumberVerification struct {
@@ -301,9 +313,9 @@ func (c *Client) ListTrustedPhones(ctx context.Context, session Session) (phones
 		TrustedPhoneNumbers []TrustedPhone `json:"trustedPhoneNumbers"`
 	}
 	if err := json.Unmarshal(response.body, &body); err != nil {
-		return nil, result, response.operationError("decode trusted phone numbers", ErrInvalidResponse, err)
+		return listed, result, response.operationError("decode trusted phone numbers", ErrInvalidResponse, err)
 	}
-	phones = body.PhoneNumberVerification.TrustedPhoneNumbers
+	phones := body.PhoneNumberVerification.TrustedPhoneNumbers
 	if len(phones) == 0 {
 		phones = body.TrustedPhoneNumbers
 	}
@@ -313,7 +325,7 @@ func (c *Client) ListTrustedPhones(ctx context.Context, session Session) (phones
 			valid = append(valid, phone)
 		}
 	}
-	return valid, result, nil
+	return TrustedPhonesResult{Phones: valid, SMSAlreadySent: response.status == http.StatusCreated}, result, nil
 }
 
 // RequestSMSCode asks Apple to send a two-factor code to a selected trusted

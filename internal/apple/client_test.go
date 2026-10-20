@@ -325,7 +325,7 @@ func TestSMSFallbackUsesTrustedPhoneEndpoints(t *testing.T) {
 		}
 		switch request.Method + " " + request.URL.Path {
 		case http.MethodGet + " /appleauth/auth":
-			return testResponse(request, http.StatusCreated, `{"phoneNumberVerification":{"trustedPhoneNumbers":[{"id":7,"obfuscatedNumber":"+1 •••• 6789","lastTwoDigits":"89"}]}}`, nil), nil
+			return testResponse(request, http.StatusOK, `{"phoneNumberVerification":{"trustedPhoneNumbers":[{"id":7,"obfuscatedNumber":"+1 •••• 6789","lastTwoDigits":"89"}]}}`, nil), nil
 		case http.MethodPut + " /appleauth/auth/verify/phone":
 			var payload struct {
 				PhoneNumber struct {
@@ -392,6 +392,27 @@ func TestSMSFallbackUsesTrustedPhoneEndpoints(t *testing.T) {
 	}
 	if !reflect.DeepEqual(requests, want) {
 		t.Fatalf("requests = %#v, want %#v", requests, want)
+	}
+}
+
+func TestListTrustedPhonesReportsAppleAutomaticSMS(t *testing.T) {
+	requestCount := 0
+	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		if request.Method != http.MethodGet || request.URL.Path != "/appleauth/auth" {
+			return nil, fmt.Errorf("unexpected request %s %s", request.Method, request.URL.Path)
+		}
+		return testResponse(request, http.StatusCreated, `{"trustedPhoneNumbers":[{"id":7,"lastTwoDigits":"89"}]}`, nil), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, _, err := client.ListTrustedPhonesWithStatus(context.Background(), Session{Region: RegionGlobal, FrameID: "frame"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !listed.SMSAlreadySent || len(listed.Phones) != 1 || listed.Phones[0].ID != 7 || requestCount != 1 {
+		t.Fatalf("automatic SMS result = %#v, requests=%d", listed, requestCount)
 	}
 }
 
