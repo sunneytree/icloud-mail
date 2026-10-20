@@ -467,6 +467,7 @@ func classifyAdminAPIAppleError(err error) (result adminAPIAppleError) {
 			result.UpstreamServiceCode = upstream.ServiceCode
 			result.WebSessionDiagnostics = upstream.WebSession
 		}
+		result.Message = appendAppleUpstreamDetail(result.Message, result.UpstreamOperation, result.UpstreamStatus)
 	}()
 	if errors.Is(err, context.DeadlineExceeded) {
 		return adminAPIAppleError{Status: http.StatusGatewayTimeout, Code: hmesync.CodeUpstreamError, Message: "Apple 服务响应超时，请稍后再试"}
@@ -536,6 +537,56 @@ func classifyAdminAPIAppleError(err error) (result adminAPIAppleError) {
 		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "隐私邮箱已属于其他主号"}
 	default:
 		return adminAPIAppleError{Status: http.StatusBadGateway, Code: hmesync.CodeUpstreamError, Message: "Apple 服务暂时异常，请稍后再试"}
+	}
+}
+
+func appendAppleUpstreamDetail(message, operation string, status int) string {
+	message = strings.TrimSpace(message)
+	if message == "" || (strings.TrimSpace(operation) == "" && status == 0) {
+		return message
+	}
+	parts := make([]string, 0, 2)
+	if label := appleUpstreamOperationLabel(operation); label != "" {
+		parts = append(parts, "上游操作："+label)
+	}
+	if status > 0 {
+		parts = append(parts, "上游响应："+appleUpstreamStatusLabel(status))
+	}
+	if len(parts) == 0 {
+		return message
+	}
+	return message + "（" + strings.Join(parts, "；") + "）"
+}
+
+func appleUpstreamOperationLabel(operation string) string {
+	switch strings.TrimSpace(operation) {
+	case "list trusted phone numbers":
+		return "读取受信任手机号"
+	case "request SMS two-factor code":
+		return "请求短信验证码"
+	case "verify SMS two-factor code":
+		return "验证短信验证码"
+	case "verify two-factor code":
+		return "验证双重认证验证码"
+	case "list Hide My Email aliases":
+		return "读取隐藏邮箱目录"
+	default:
+		return strings.TrimSpace(operation)
+	}
+}
+
+func appleUpstreamStatusLabel(status int) string {
+	switch status {
+	case http.StatusLocked:
+		return "HTTP 423（Apple 当前验证挑战可能已锁定或暂不可用）"
+	case http.StatusTooManyRequests:
+		return "HTTP 429（Apple 请求过于频繁）"
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "HTTP " + strconv.Itoa(status) + "（Apple 会话未授权或已失效）"
+	case http.StatusPreconditionFailed:
+		return "HTTP 412（Apple 验证前置条件未满足）"
+	default:
+		return "HTTP " + strconv.Itoa(status)
 	}
 }
 
