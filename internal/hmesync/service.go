@@ -303,6 +303,10 @@ func (s *Service) RequestSMSAuth(
 	if !ok {
 		return SMSAuthResult{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("SMS fallback is unavailable"))
 	}
+	// A second click is an explicit resend request. The first HTTP 201 response
+	// means Apple already sent the initial code, but it must not make the
+	// resend button a no-op when that code never arrives.
+	resend := flow.smsSent
 	var phones []apple.TrustedPhone
 	autoSent := false
 	var session apple.Session
@@ -329,7 +333,7 @@ func (s *Service) RequestSMSAuth(
 	// Keep any session headers/cookies Apple rotated while listing phones,
 	// including when the UI needs to ask the user to choose one.
 	s.updateChallenge(flow)
-	if autoSent {
+	if autoSent && !resend {
 		// Apple HTTP 201 means the first trusted phone already received the
 		// code. Do not issue a second PUT, which invalidates that code.
 		if phoneID == 0 {
@@ -340,6 +344,11 @@ func (s *Service) RequestSMSAuth(
 			flow.smsSent = true
 			s.updateChallenge(flow)
 			return SMSAuthResult{Status: StatusSMSSent, ChallengeID: challengeID, SelectedPhone: &choices[0]}, nil
+		}
+	}
+	if phoneID == 0 {
+		if resend && flow.smsPhoneID > 0 {
+			phoneID = flow.smsPhoneID
 		}
 	}
 	if phoneID == 0 {
