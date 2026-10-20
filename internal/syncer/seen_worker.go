@@ -328,6 +328,22 @@ func groupSeenTasks(accountID int64, tasks []domain.SeenTask) (*seenAccountBatch
 }
 
 func (w *SeenWorker) processAccount(ctx context.Context, work *seenAccountBatch) error {
+	// Legacy flag writes are remote mutations. Keep their source pinned by the
+	// management lock, acquired before any IMAP slot; ordinary mail fetches use
+	// the independent IMAP lock and validate their source when publishing.
+	if locker, ok := w.locker.(interface {
+		WithAccountLock(context.Context, int64, func() error) error
+	}); ok {
+		acquireCtx, cancel := context.WithTimeout(ctx, w.acquireTimeout)
+		defer cancel()
+		return locker.WithAccountLock(acquireCtx, work.id, func() error {
+			return w.processAccountIMAP(ctx, work)
+		})
+	}
+	return w.processAccountIMAP(ctx, work)
+}
+
+func (w *SeenWorker) processAccountIMAP(ctx context.Context, work *seenAccountBatch) error {
 	acquireCtx, cancelAcquire := context.WithTimeout(ctx, w.acquireTimeout)
 	defer cancelAcquire()
 	return w.locker.WithAccountIMAPSlot(acquireCtx, work.id, func() error {

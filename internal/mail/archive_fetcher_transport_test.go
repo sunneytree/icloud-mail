@@ -253,6 +253,9 @@ type archiveIMAPFixture struct {
 	selections    int
 	loginCount    int
 	headerFetches int
+	batchBodies   bool
+	bodyUIDLast   bool
+	bodyFetches   int
 	bodyUIDs      []imap.UID
 	blockUID      imap.UID
 	bodyStarted   chan struct{}
@@ -260,7 +263,7 @@ type archiveIMAPFixture struct {
 	searchPolicy  func(*imap.SearchCriteria) error
 }
 
-func startArchiveIMAPFixture(t *testing.T, messageCount int, blockUID imap.UID) *archiveIMAPFixture {
+func startArchiveIMAPFixture(t *testing.T, messageCount int, blockUID imap.UID, caps ...imap.CapSet) *archiveIMAPFixture {
 	t.Helper()
 	fixture := &archiveIMAPFixture{
 		account:  domain.Account{ID: 17, MailboxType: domain.MailboxTypeCustom, Email: "primary@example.test", IMAPHost: "127.0.0.1", IMAPUsername: "primary@example.test", Enabled: true},
@@ -292,12 +295,16 @@ func startArchiveIMAPFixture(t *testing.T, messageCount int, blockUID imap.UID) 
 		t.Fatal(err)
 	}
 	fixture.account.IMAPPort = listener.Addr().(*net.TCPAddr).Port
-	server := imapserver.New(&imapserver.Options{
+	options := &imapserver.Options{
 		Logger: log.New(io.Discard, "", 0),
 		NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return &archiveIMAPSession{Session: backend.NewSession(), fixture: fixture}, nil, nil
 		},
-	})
+	}
+	if len(caps) > 0 {
+		options.Caps = caps[0]
+	}
+	server := imapserver.New(options)
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Serve(listener) }()
 	t.Cleanup(func() {
@@ -379,8 +386,37 @@ func (session *archiveIMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.
 			return errors.New("archive fixture requires UID FETCH for full messages")
 		}
 		uids, ok := set.Nums()
-		if !ok || len(uids) != 1 {
+		if !ok || (len(uids) != 1 && !session.fixture.batchBodies) {
 			return fmt.Errorf("full body request = %v, want one static UID", numSet)
+		}
+		session.fixture.mu.Lock()
+		session.fixture.bodyFetches++
+		session.fixture.mu.Unlock()
+		if session.fixture.batchBodies {
+			for _, uid := range uids {
+				session.fixture.mu.Lock()
+				session.fixture.bodyUIDs = append(session.fixture.bodyUIDs, uid)
+				session.fixture.mu.Unlock()
+				response := w.CreateMessage(uint32(uid))
+				if !session.fixture.bodyUIDLast {
+					response.WriteUID(uid)
+				}
+				raw := session.fixture.raw[uint32(uid)]
+				literal := response.WriteBodySection(section, int64(len(raw)))
+				if _, err := io.WriteString(literal, raw); err != nil {
+					return err
+				}
+				if err := literal.Close(); err != nil {
+					return err
+				}
+				if session.fixture.bodyUIDLast {
+					response.WriteUID(uid)
+				}
+				if err := response.Close(); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 		uid := uids[0]
 		session.fixture.mu.Lock()

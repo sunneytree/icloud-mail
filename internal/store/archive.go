@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdmail "net/mail"
 	"os"
 	"path/filepath"
 	"sort"
@@ -135,17 +136,18 @@ func (s *Store) MailArchiveTempDir() string {
 }
 
 type stagedArchiveContent struct {
-	path    string
-	bytes   int64
-	sha256  string
-	created bool
+	path       string
+	bytes      int64
+	sha256     string
+	created    bool
+	superseded string
 }
 
 func archiveMessageKey(message domain.ArchivedMessage) string {
 	return fmt.Sprintf("%d/%d/%d", message.AccountID, message.UIDValidity, message.UID)
 }
 
-func (s *Store) stageArchiveMessages(messages []domain.ArchivedMessage) (_ map[string]stagedArchiveContent, returnedErr error) {
+func (s *Store) stageArchiveMessages(ctx context.Context, messages []domain.ArchivedMessage, imap bool) (_ map[string]stagedArchiveContent, returnedErr error) {
 	staged := make(map[string]stagedArchiveContent)
 	defer func() {
 		if returnedErr != nil {
@@ -168,12 +170,15 @@ func (s *Store) stageArchiveMessages(messages []domain.ArchivedMessage) (_ map[s
 			fmt.Sprintf("uidv-%d", message.UIDValidity),
 			fmt.Sprintf("uid-%d.eml", message.UID),
 		)
+		relative, superseded, err := s.archiveContentDestination(ctx, message, relative, imap)
+		if err != nil {
+			return nil, err
+		}
 		finalPath := filepath.Join(s.mailArchiveDir, relative)
 		if err := os.MkdirAll(filepath.Dir(finalPath), 0o700); err != nil {
 			return nil, fmt.Errorf("create archive message directory: %w", err)
 		}
 		var content stagedArchiveContent
-		var err error
 		if message.RawMIMEPath != "" {
 			content, err = s.publishStagedArchiveFile(message, finalPath, relative)
 		} else {
@@ -183,10 +188,94 @@ func (s *Store) stageArchiveMessages(messages []domain.ArchivedMessage) (_ map[s
 			return nil, err
 		}
 		key := archiveMessageKey(message)
+		if previous, exists := staged[key]; exists && (previous.path != content.path || previous.sha256 != content.sha256) {
+			s.cleanupPublishedArchive(map[string]stagedArchiveContent{key: content})
+			return nil, errors.New("duplicate archived message identity has conflicting content")
+		}
 		content.created = content.created || staged[key].created
+		content.superseded = superseded
+		if content.superseded == "" {
+			content.superseded = staged[key].superseded
+		}
 		staged[key] = content
 	}
 	return staged, nil
+}
+
+// Web text projections and complete IMAP MIME share a logical UID, but are
+// different files. Publish upgrades immutably so rollback keeps the old body.
+func (s *Store) archiveContentDestination(ctx context.Context, message domain.ArchivedMessage, fallback string, imap bool) (string, string, error) {
+	var relative, state, digest, messageID string
+	var size int64
+	err := s.queryRowContext(ctx, `SELECT content_path, content_state, content_bytes, content_sha256, message_id
+		FROM archived_messages WHERE account_id=? AND uid_validity=? AND upstream_uid=?`,
+		message.AccountID, int64(message.UIDValidity), int64(message.UID)).Scan(&relative, &state, &size, &digest, &messageID)
+	if err == sql.ErrNoRows {
+		return fallback, "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("read existing archive destination: %w", err)
+	}
+	if state != archiveContentAvailable || relative == "" {
+		return fallback, "", nil
+	}
+	existingPath, ok := s.safeArchivePath(relative)
+	if !ok {
+		return "", "", errors.New("existing archive destination is unsafe")
+	}
+	if !imap || messageID == "" || messageID != strings.TrimSpace(message.MessageID) {
+		return relative, "", nil
+	}
+	incomingDigest := strings.ToLower(strings.TrimSpace(message.RawSHA256))
+	if message.RawMIMEPath == "" {
+		sum := sha256.Sum256(message.RawMIME)
+		incomingDigest = hex.EncodeToString(sum[:])
+	} else if !validSHA256Hex(incomingDigest) {
+		source, pathErr := filepath.Abs(strings.TrimSpace(message.RawMIMEPath))
+		root := filepath.Clean(s.MailArchiveTempDir())
+		if pathErr != nil || source == root || !strings.HasPrefix(source, root+string(os.PathSeparator)) {
+			return "", "", errors.New("staged archive message is outside the archive temporary directory")
+		}
+		incomingDigest, err = hashArchiveFile(message.RawMIMEPath)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if incomingDigest == digest {
+		return relative, "", nil
+	}
+	if _, exists, err := matchingArchiveFile(existingPath, size, digest); err != nil {
+		return "", "", err
+	} else if !exists {
+		return relative, "", nil
+	}
+	file, err := os.Open(existingPath)
+	if err != nil {
+		return "", "", fmt.Errorf("open existing archive header: %w", err)
+	}
+	header, readErr := stdmail.ReadMessage(io.LimitReader(file, 256<<10))
+	_ = file.Close()
+	if readErr != nil || header.Header.Get("X-Mail-Archive-Source") != "icloud-web-text-parts" ||
+		strings.TrimSpace(header.Header.Get("Message-Id")) != messageID {
+		return relative, "", nil
+	}
+	upgraded := filepath.Join(filepath.Dir(fallback), fmt.Sprintf("uid-%d-imap-%s.eml", message.UID, incomingDigest))
+	return upgraded, relative, nil
+}
+
+func (s *Store) cleanupSupersededArchive(ctx context.Context, staged map[string]stagedArchiveContent) {
+	for _, content := range staged {
+		if content.superseded == "" || content.superseded == content.path {
+			continue
+		}
+		var referenced int
+		if err := s.queryRowContext(ctx, `SELECT COUNT(*) FROM archived_messages WHERE content_path=?`, content.superseded).Scan(&referenced); err != nil || referenced != 0 {
+			continue
+		}
+		if path, ok := s.safeArchivePath(content.superseded); ok {
+			_ = os.Remove(path)
+		}
+	}
 }
 
 func (s *Store) publishArchiveBytes(raw []byte, finalPath, relative string) (stagedArchiveContent, error) {

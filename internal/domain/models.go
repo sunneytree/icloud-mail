@@ -64,6 +64,9 @@ type Account struct {
 	// mailboxes. It is deliberately separate from Email, which remains the
 	// legacy iCloud identity used by Apple sessions and external API lookups.
 	EmailSuffix string
+	// Configuration revisions exclude alias mutations and sync health writes.
+	MailboxConfigVersion int64 `json:"-"`
+	MailTransportVersion int64 `json:"-"`
 }
 
 // AppleWebSession stores the encrypted Apple web session associated with an
@@ -110,9 +113,12 @@ type PendingAliasAPIKey struct {
 }
 
 type Alias struct {
-	ID           int64
-	AccountID    int64
-	AccountEmail string
+	// Internal creation provenance; persisted with pending candidates, never credentials.
+	CreationChannel  string `json:"-"`
+	CreationRemoteID string `json:"-"`
+	ID               int64
+	AccountID        int64
+	AccountEmail     string
 	// AccountDisabled is a read-time parent gate; Enabled keeps the alias's
 	// own setting so re-enabling the parent does not revive manually paused aliases.
 	AccountDisabled bool
@@ -141,6 +147,7 @@ type Alias struct {
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 	LatestReceivedAt     *time.Time
+	ReceiveRevision      int64 `json:"-"`
 }
 
 // MailGroup is an administrator-defined collection of privacy mailboxes.
@@ -348,6 +355,9 @@ type IMAPSyncState struct {
 	UIDValidity uint32
 	LastUID     uint32
 	UpdatedAt   time.Time
+	// ActiveWindowSince pins the body cutoff across pending shared-receive
+	// batches, including service restarts. Zero means no pending window.
+	ActiveWindowSince time.Time
 }
 
 // SeenTask is a durable request to mark one message as seen in its account's

@@ -11,6 +11,10 @@ import (
 
 func (s *Store) migrateAliasCreationEvents(ctx context.Context, tx *sql.Tx) error {
 	statements := []string{
+		`CREATE TABLE IF NOT EXISTS apple_alias_creation_candidates (
+		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		channel TEXT NOT NULL CHECK(channel IN ('apple_account','icloud_web')),
+		remote_id TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS apple_alias_creation_events (
 		account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
 		address TEXT NOT NULL, created_at BIGINT NOT NULL,

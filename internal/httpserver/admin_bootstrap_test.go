@@ -22,7 +22,7 @@ func TestAdminSessionBootstrapAuthenticatedPrivateAndEscaped(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := serveAdminRouterRequest(router, http.MethodGet, "/custom/admin/pool", nil, map[string]string{"Cookie": cookie.String()})
-	if response.Code != 200 || response.Header().Get("Cache-Control") != "no-store, private" || response.Header().Get("CDN-Cache-Control") != "no-store" || response.Header().Get("Vary") != "Cookie" {
+	if response.Code != 200 || response.Header().Get("Cache-Control") != "no-store, private, no-transform" || response.Header().Get("CDN-Cache-Control") != "no-store" || response.Header().Get("Vary") != "Cookie" {
 		t.Fatalf("private HTML headers: status=%d headers=%v", response.Code, response.Header())
 	}
 	_, payload, found := strings.Cut(response.Body.String(), `<script type="application/json" id="icloud-admin-session">`)

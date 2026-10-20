@@ -53,7 +53,8 @@ type demandIMAPTrace struct {
 
 type demandIMAPSession struct {
 	imapserver.Session
-	trace *demandIMAPTrace
+	trace      *demandIMAPTrace
+	beforeBody func()
 }
 
 func (s *demandIMAPSession) Login(username, password string) error {
@@ -69,6 +70,9 @@ func (s *demandIMAPSession) Fetch(w *imapserver.FetchWriter, set imap.NumSet, op
 			return errors.New("fixture requires BODY.PEEK")
 		}
 		if section.Specifier == imap.PartSpecifierNone {
+			if s.beforeBody != nil {
+				s.beforeBody()
+			}
 			uids, ok := set.(imap.UIDSet)
 			if !ok {
 				return errors.New("fixture requires UID FETCH")

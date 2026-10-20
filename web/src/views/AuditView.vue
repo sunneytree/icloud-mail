@@ -22,7 +22,7 @@
     </SectionHeader>
 
     <div v-if="loading && logs.length === 0" class="data-panel loading-panel">
-      <el-skeleton :rows="7" animated />
+      <el-skeleton :rows="7" animated role="status" aria-live="polite" aria-busy="true" aria-label="正在加载审计记录" />
     </div>
 
     <div v-else-if="loadError && logs.length === 0" class="load-failed">

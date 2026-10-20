@@ -108,9 +108,10 @@ type Manager struct {
 	demandMu             sync.Mutex
 	demandFlights        map[int64]*aliasDemandFlight
 
-	locksMu  sync.Mutex
-	locks    map[int64]*accountLock
-	stopping atomic.Bool
+	locksMu   sync.Mutex
+	locks     map[int64]*accountLock
+	imapLocks map[int64]*accountLock
+	stopping  atomic.Bool
 
 	manualMu         sync.Mutex
 	manualJobs       map[int64]syncFlowSeed
@@ -139,6 +140,7 @@ func New(repo Repository, cipher CredentialCipher, fetcher MailFetcher, logger *
 		retryDelays:  append([]time.Duration(nil), defaultAutomaticIMAPRetryDelays...),
 		retryBudget:  automaticIMAPRetryBudget,
 		locks:        make(map[int64]*accountLock),
+		imapLocks:    make(map[int64]*accountLock),
 		manualJobs:   make(map[int64]syncFlowSeed),
 		manualDone:   make(chan struct{}),
 		progress:     make(map[int64]activeMailboxSync),
@@ -723,7 +725,7 @@ func (m *Manager) syncAllRoundDetailedWithContexts(
 				)
 				lockCtx, cancelLock := m.withTimeout(queueCtx, m.syncTimeout)
 				var err error
-				release, err = m.acquireAccountUntil(lockCtx, retryCtx, account.ID)
+				release, err = m.acquireIMAPAccountUntil(lockCtx, retryCtx, account.ID)
 				if err == nil {
 					err = lockCtx.Err()
 				}
@@ -768,7 +770,7 @@ func (m *Manager) syncAllRoundDetailedWithContexts(
 				}
 			} else {
 				var acquired bool
-				release, acquired = m.tryAcquireAccount(account.ID)
+				release, acquired = m.tryAcquireIMAPAccount(account.ID)
 				if !acquired {
 					return
 				}
@@ -1141,7 +1143,7 @@ func (m *Manager) WithAccountIMAPSlot(ctx context.Context, accountID int64, oper
 	if operation == nil {
 		return errors.New("account IMAP operation must not be nil")
 	}
-	release, err := m.acquireAccount(ctx, accountID)
+	release, err := m.acquireIMAPAccountUntil(ctx, nil, accountID)
 	if err != nil {
 		return err
 	}
@@ -1211,6 +1213,7 @@ func (m *Manager) syncAccountLocked(
 		flow,
 	)
 	failures := newFailureRecorder(m, ctx, accountID, account.UpdatedAt)
+	failures.account = &account
 	defer failures.close()
 	defer func() {
 		if syncErr != nil && !errors.Is(syncErr, ErrSyncPending) && !errors.Is(syncErr, ErrSyncDeferred) &&
@@ -1317,7 +1320,18 @@ func (m *Manager) syncAccountLocked(
 	)
 	failedOperation = "save_result"
 	now := time.Now().UTC()
-	if err := m.repo.ApplyMailboxSync(ctx, accountID, account.UpdatedAt, enabled, result, now); err != nil {
+	var publishErr error
+	if repo, ok := m.repo.(interface {
+		ApplyObservedMailboxSync(context.Context, domain.Account, []domain.Alias, domain.MailboxSyncResult, time.Time) error
+	}); ok {
+		publishErr = repo.ApplyObservedMailboxSync(ctx, account, enabled, result, now)
+	} else {
+		publishErr = m.repo.ApplyMailboxSync(ctx, accountID, account.UpdatedAt, enabled, result, now)
+	}
+	if errors.Is(publishErr, store.ErrAliasMailboxSyncStale) {
+		return ErrSyncDeferred
+	}
+	if err := publishErr; err != nil {
 		return fmt.Errorf("批量保存 IMAP 同步结果: %w", err)
 	}
 	if active {
@@ -1455,9 +1469,9 @@ func isTransientIMAPTransportError(err error) bool {
 	return false
 }
 
-// WithAccountLock serializes account configuration changes with IMAP syncs.
-// The service intentionally runs as a single process, so this lock also forms
-// the publication boundary for credentials, cursor progress, and archived mail.
+// WithAccountLock serializes configuration and Apple management operations.
+// IMAP network work uses a separate keyed lock; its publication rechecks source
+// configuration and recipient identities in a short database transaction.
 func (m *Manager) WithAccountLock(ctx context.Context, accountID int64, operation func() error) error {
 	if operation == nil {
 		return errors.New("主号操作不能为空")
@@ -1485,6 +1499,7 @@ type failureRecorder struct {
 	parent    context.Context
 	accountID int64
 	version   time.Time
+	account   *domain.Account
 	fallback  context.Context
 	cancel    context.CancelFunc
 }
@@ -1530,6 +1545,11 @@ func (r *failureRecorder) record(syncErr error) {
 	message := string(messageRunes)
 	now := time.Now().UTC()
 	if err := r.update(func(ctx context.Context) error {
+		if repo, ok := r.manager.repo.(interface {
+			RecordObservedMailboxSyncFailure(context.Context, domain.Account, string, time.Time) error
+		}); ok && r.account != nil {
+			return repo.RecordObservedMailboxSyncFailure(ctx, *r.account, message, now)
+		}
 		return r.manager.repo.RecordMailboxSyncFailure(ctx, r.accountID, r.version, message, now)
 	}); err != nil {
 		r.manager.logger.Error("记录批量同步失败状态失败", "account_id", r.accountID, "error", err)
@@ -1541,11 +1561,23 @@ func (m *Manager) acquireAccount(ctx context.Context, accountID int64) (func(), 
 }
 
 func (m *Manager) acquireAccountUntil(ctx, stopCtx context.Context, accountID int64) (func(), error) {
+	return m.acquireKeyedAccountUntil(ctx, stopCtx, accountID, false)
+}
+
+func (m *Manager) acquireIMAPAccountUntil(ctx, stopCtx context.Context, accountID int64) (func(), error) {
+	return m.acquireKeyedAccountUntil(ctx, stopCtx, accountID, true)
+}
+
+func (m *Manager) acquireKeyedAccountUntil(ctx, stopCtx context.Context, accountID int64, imap bool) (func(), error) {
 	m.locksMu.Lock()
-	lock, ok := m.locks[accountID]
+	locks := m.locks
+	if imap {
+		locks = m.imapLocks
+	}
+	lock, ok := locks[accountID]
 	if !ok {
 		lock = &accountLock{token: make(chan struct{}, 1)}
-		m.locks[accountID] = lock
+		locks[accountID] = lock
 	}
 	lock.refs++
 	m.locksMu.Unlock()
@@ -1555,12 +1587,12 @@ func (m *Manager) acquireAccountUntil(ctx, stopCtx context.Context, accountID in
 	}
 	select {
 	case lock.token <- struct{}{}:
-		return m.accountLockRelease(accountID, lock), nil
+		return m.accountLockRelease(accountID, lock, imap), nil
 	case <-ctx.Done():
-		m.releaseAccountLock(accountID, lock)
+		m.releaseAccountLock(accountID, lock, imap)
 		return nil, contextTerminationError(ctx)
 	case <-stopDone:
-		m.releaseAccountLock(accountID, lock)
+		m.releaseAccountLock(accountID, lock, imap)
 		if ctx.Err() != nil {
 			return nil, contextTerminationError(ctx)
 		}
@@ -1572,24 +1604,36 @@ func (m *Manager) acquireAccountUntil(ctx, stopCtx context.Context, accountID in
 // manual or scheduled sync instead of waiting while it occupies global
 // concurrency capacity.
 func (m *Manager) tryAcquireAccount(accountID int64) (func(), bool) {
+	return m.tryAcquireKeyedAccount(accountID, false)
+}
+
+func (m *Manager) tryAcquireIMAPAccount(accountID int64) (func(), bool) {
+	return m.tryAcquireKeyedAccount(accountID, true)
+}
+
+func (m *Manager) tryAcquireKeyedAccount(accountID int64, imap bool) (func(), bool) {
 	m.locksMu.Lock()
-	if _, busy := m.locks[accountID]; busy {
+	locks := m.locks
+	if imap {
+		locks = m.imapLocks
+	}
+	if _, busy := locks[accountID]; busy {
 		m.locksMu.Unlock()
 		return nil, false
 	}
 	lock := &accountLock{token: make(chan struct{}, 1), refs: 1}
 	lock.token <- struct{}{}
-	m.locks[accountID] = lock
+	locks[accountID] = lock
 	m.locksMu.Unlock()
-	return m.accountLockRelease(accountID, lock), true
+	return m.accountLockRelease(accountID, lock, imap), true
 }
 
-func (m *Manager) accountLockRelease(accountID int64, lock *accountLock) func() {
+func (m *Manager) accountLockRelease(accountID int64, lock *accountLock, imap bool) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			<-lock.token
-			m.releaseAccountLock(accountID, lock)
+			m.releaseAccountLock(accountID, lock, imap)
 		})
 	}
 }
@@ -1626,11 +1670,15 @@ func contextTerminationError(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (m *Manager) releaseAccountLock(accountID int64, lock *accountLock) {
+func (m *Manager) releaseAccountLock(accountID int64, lock *accountLock, imap bool) {
 	m.locksMu.Lock()
 	defer m.locksMu.Unlock()
 	lock.refs--
-	if lock.refs == 0 && m.locks[accountID] == lock {
-		delete(m.locks, accountID)
+	locks := m.locks
+	if imap {
+		locks = m.imapLocks
+	}
+	if lock.refs == 0 && locks[accountID] == lock {
+		delete(locks, accountID)
 	}
 }

@@ -6,7 +6,8 @@
     :title="displayMessage"
     :closable="closable"
     show-icon
-    role="status"
+    :role="alertRole"
+    :aria-live="alertRole === 'alert' ? 'assertive' : 'polite'"
     @close="$emit('close')"
   >
     <p v-if="requestId" class="request-alert__id">
@@ -33,4 +34,5 @@ const displayMessage = computed(
 );
 const requestId = computed(() => props.requestId || props.error?.requestId || "");
 const visible = computed(() => Boolean(props.message || props.error));
+const alertRole = computed(() => props.type === "error" || props.type === "warning" ? "alert" : "status");
 </script>

@@ -1,6 +1,6 @@
 <template>
   <section ref="aliasSelectionContainer" class="page-stack" @pointerdown.capture="aliasDrag.pointerDown">
-    <div v-if="loading && !account" class="data-panel loading-panel">
+    <div v-if="loading && !account" class="data-panel loading-panel" role="status" aria-live="polite" aria-busy="true" aria-label="正在加载主号详情">
       <el-skeleton :rows="9" animated />
     </div>
 
@@ -2173,10 +2173,6 @@ function syncAliasesFromApple() {
   ) {
     return;
   }
-  if (!appleSessionAuthenticated.value) {
-    openAppleLogin({ resumeSync: true });
-    return;
-  }
   performAliasesSync();
 }
 
@@ -2251,7 +2247,7 @@ async function disconnectAppleSession() {
   appleDisconnectLoading.value = true;
   try {
     await ElMessageBox.confirm(
-      "退出目录连接后，同步与管理目录需要重新登录；新建连接的会话保持不变。",
+      "退出目录连接后，创建核验、停用与删除需要重新登录；已登录的新建连接仍可尝试读取目录。",
       "退出目录连接",
       {
         type: "warning",

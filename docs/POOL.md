@@ -36,7 +36,9 @@ Apple 未登录时先完成登录，再点击创建。明确限流进入等待�
 - `GET` 同路径读取最新任务；没有任务时 `job=null`。
 - `POST` 同路径加 `/stop`，JSON `{}`，停止后续请求；进行中的请求保存结果后进入终态。
 - `GET/POST/DELETE /admin/api/v1/accounts/ACCOUNT_ID/apple-account-auth` 管理新通道会话；`POST .../verify` 提交 challenge_id 和六位 code。
-- 管理会话每 4 分钟尝试保活；会话失效后需重新登录，不自动保存或重放 Apple 密码。
+- 管理会话按每号 4～6 分钟随机计划尝试保活；每个到期主号独立执行，最多一个在途保活任务，不设全局 4 个名额。重试遵循持久化退避和 Apple 更长的 Retry-After，不自动保存或重放 Apple 密码。
+- 连接状态可附带 `health`（`healthy`、`retry_wait`、`login_required`）、`last_refreshed_at`、`next_refresh_at`、`next_retry_at` 与 `refresh_failures`。临时续期故障和明确认证失效分开展示，原 `status` 合同保持；状态读取只访问本地记录。
+- 隐藏邮箱只读目录优先使用 iCloud Web，仅在登录缺失或明确认证失效时尝试已保存的 Apple Account 连接。该补充通道不修改退役、删除或创建流程，不根据列表缺项清理地址。
 
 单次探测接口：`POST /admin/api/v1/accounts/ACCOUNT_ID/aliases/create-now`，JSON `{"channel":"auto"}`；兼容旧 JSON `{}`，默认自动选择初始通道。
 使用管理员 session Cookie 和 `X-CSRF-Token`，不是邮箱池项目 Key。
@@ -110,6 +112,25 @@ curl 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-
 }
 ```
 
+### 退休作业核验与显式恢复
+
+未知结果先用上述 GET 找回原作业快照；GET 和原始 `POST /aliases/batch` 的幂等重放都不会恢复执行。核验或恢复使用 `POST <admin-path>/api/v1/pool/aliases/batch/jobs/:operationID/reconcile`，仍要求管理员 Session、同源 CSRF 和原项目 Pool Key：
+
+```sh
+curl -X POST 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-20260918-0001/reconcile' \
+  -H 'Cookie: icloud_admin_session=ADMIN_SESSION' \
+  -H 'X-CSRF-Token: ADMIN_CSRF' \
+  -H 'Authorization: Bearer pool_PROJECT_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"alias_id":123,"lease_id":"LEASE_ID"}],"resume":false}'
+```
+
+- 请求必须携带原作业完整、顺序完全一致的 `items`（包含原 `alias_id`、`lease_id`），以及布尔值 `resume`。成功返回 `202`，响应与读取作业的 DTO 相同。作业缺失或属于其他项目返回 `404`；items 内容或顺序变化返回 `409 IDEMPOTENCY_CONFLICT`。
+- `resume=false` 只读取完整、权威的 Apple 目录。确认地址 absent 后，仅对原 alias/lease 精确绑定执行本地退休收口；确认 present 时保持 `review`，结果码为 `APPLE_ALIAS_STILL_PRESENT`，不发送删除。
+- `resume=true` 是明确的再次删除授权：重新读取完整、权威目录，fresh 确认 present 后沿原删除流程执行；确认 absent 时直接执行原绑定的退休收口。目录读取失败或结果未知时保持 `review`，lease 仍锁在 `retiring`，不开放取码、续期、释放、确认使用或再次领取，也不自动重放未知副作用。
+- 同一主号的目录核验和删除串行执行。Apple `RetryAfter` 使用独立 cooldown，最短一分钟。原作业核验/恢复在途时，同一 `resume` 返回当前快照；不同 `resume` 返回 `409 RETIREMENT_ACTION_CONFLICT`。
+- worker 结束后再次显式 POST 会启动新一轮核验或恢复；`operationID` 标识原作业，并非核验/恢复请求的 at-most-once 标识。响应丢失时先 GET 恢复未知状态，再决定是否明确授权下一轮。
+
 成功响应形状：
 
 ```json
@@ -156,11 +177,11 @@ curl 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-
 | `POST /api/v1/pool/leases/LEASE_ID/release` | 默认 `yes` 模式可显式释放 `used`；`no` 模式只可释放未提交的 `leased`。两者均轮换凭据 |
 | `POST /api/v1/pool/leases/LEASE_ID/renew` | 仅 `no` 模式的 `leased` 可用；JSON `{"ttl_seconds":1800}`，从当前时间续期 |
 
-`code` 可追加 `after=RFC3339`，查询起点取 after 与领取时间中较晚者；`data.success=true` 时读取 `data.otp` 和 `data.time`，否则 `data.code=no_code`、`data.retryable=true`。请求与该邮箱的 OTP、Bearer 和直达链接共用速率预算：共享模式容量 2、每 2 秒恢复 1 次；长等待期间也恢复，完成后不追加冷却。普通读取和单个长等待可共存，第二个同类在途或额度/容量已满返回 `429 RATE_LIMITED`。`X-RateLimit-Reason` 标识原因，`Retry-After` 按剩余时间向上取整，`X-Retry-After-Ms` 提供毫秒值；被拦截请求不延期。旧非共享路径仍保持单 alias 独占和完成后 2 秒冷却。详见 [分层取件限流](PICKUP-RATE.md)。
+`code` 可追加 `after=RFC3339`，查询起点取 after 与领取时间中较晚者；`data.success=true` 时读取 `data.otp` 和 `data.time`，否则 `data.code=no_code`、`data.retryable=true`。请求与该邮箱的 OTP、Bearer 和直达链接共用速率预算：共享模式容量 2、每 2 秒恢复 1 次；长等待期间也恢复，完成后不追加冷却。额度内同 root 的多个普通读取及长等待可共存，刷新频率超额返回 `429 RATE_LIMITED`；并发容量不足、队满或排队超时返回 `503 PICKUP_BUSY`。`X-RateLimit-Reason` 标识原因，`Retry-After` 按剩余时间向上取整，`X-Retry-After-Ms` 提供毫秒值；被拦截请求不延期。旧非共享路径仍保持单 alias 独占和完成后 2 秒冷却。详见 [分层取件限流](PICKUP-RATE.md)。
 
-启用按需共享收件与 IMAP IDLE 时，同主号共用一个通知连接及一个活跃读取连接，不为 root 或 `+tag` 单独连接。每主号最多容纳 64 个 HTTP 取件请求、全站最多 128 个、每秒接纳 100 次，超量不排队；上游同步仍按主号串行，受独立并发与最短 2 秒启动间隔约束。连接空闲 10 分钟回收，主号停用、删除、凭据变化和服务关闭也会回收。未启用共享模式时保留每主号 2 个、全站 16 个请求上限。限制按服务进程计数。
+启用按需共享收件与 IMAP IDLE 时，同主号共用一个通知连接及一个活跃读取连接，不为 root 或 `+tag` 单独连接。共享模式取消主号 64 个在途及全站每秒 100 次的限制；全站最多 512 个执行槽，总受理量为 1024（执行与排队合计），排队预算 2 秒。长等待最多占 384 个执行槽、640 个受理名额，为普通读取保留余量。上游同步仍按主号串行，受独立并发与最短 2 秒启动间隔约束。连接空闲 10 分钟回收，主号停用、删除、凭据变化和服务关闭也会回收。未启用共享模式时保留每主号 2 个、全站 16 个请求上限和每秒 100 次的频率预算；并发容量不足返回 503，频率超额返回 429。限制按服务进程计数。
 
-共享收件冷启动仅检查最近 128 条候选头部，正文限最近 15 分钟；正常活跃时按主号已提交 UID 增量继续，已归档正文不重复下载。IDLE 到达时合并通知；有取件需求且观测超过 5 秒才补查，无人请求不按周期拉取。未启用共享收件时继续使用原目标 alias 按需路径。
+共享收件冷启动或闲置恢复先用服务器日期搜索定位最近 15 分钟窗口，按 UID 分批检查候选头部，服务默认每批 128 条；正文再按 INTERNALDATE 精确过滤，只读取窗口内且归属已登记地址的邮件，不截断为最后 128 封。待处理窗口与游标同事务持久化，跨批次及重启继续原窗口，提交失败不推进游标。支持 ESEARCH 时获取最小 UID 与数量；仅支持 IMAP rev1 的服务器仍可能返回较大的日期匹配 UID 元数据，但不回填整个历史邮箱正文。正常活跃时按主号已提交 UID 增量继续，已归档正文不重复下载。IDLE 到达时合并通知；有取件需求且观测超过 5 秒才补查，无人请求不按周期拉取。未启用共享收件时继续使用原目标 alias 按需路径。
 
 ### 可选等待新验证码
 
@@ -168,8 +189,8 @@ curl 'https://mail.example.com/ADMIN_PATH/api/v1/pool/aliases/batch/jobs/retire-
 
 - `wait_seconds` 为单个整数 `0..15`，默认 `0`：兼容原先同步一次后立即返回的语义。空值、重复值、负值、小数及越界值返回 `400 INVALID_POOL_REQUEST`。
 - 启用共享收件后，正值指定本次等待预算（包含首轮同步等待）。若无符合 `after` 的验证码，等待共享归档提交或原有 5 秒按需补查期限；有新码立即返回原 DTO，到期返回原 `no_code`，不增加响应字段。未配置共享通知能力时退回原单次读取。
-- 首轮同步未完成或确有上游错误仍返回 `503 SYNC_UNAVAILABLE` 与 `Retry-After: 3`；它与正常无新码不同。HTTP 超时应比 `wait_seconds` 多留网络/解码余量，并受业务总 deadline 约束。
-- 共享模式同 root 最多一个普通读取及一个长等待，共用上述速率预算；等待不额外占上游连接，也不持有项目池或全量凭据轮换锁。每次归档检查及最终响应重新验证 Pool Key、项目/lease 归属、live 状态和主号/alias 启用状态。
+- 正值等待预算在首轮同步期间耗尽时，最终读取一次本地归档，返回已到达的新码或正常 `no_code`；请求已取消则结束响应。单次读取同步未完成或确有上游错误仍返回 `503 SYNC_UNAVAILABLE` 与 `Retry-After: 3`，与正常无新码不同。HTTP 超时应比 `wait_seconds` 多留网络/解码余量，并受业务总 deadline 约束。
+- 共享模式同 root 的多个普通读取及长等待可在速率额度内共存；等待不额外占上游连接，也不持有项目池或全量凭据轮换锁。Pool 归档读取使用共享读锁，修改操作继续互斥。每次归档检查及最终响应重新验证 Pool Key、项目/lease 归属、live 状态和主号/alias 启用状态。
 - 客户端断开只结束自己的等待，不取消其他读者共享的同步。默认 OTP 直达链接及原有响应合同保持不变；常驻读取连接优化也适用于这些链接。
 
 ## 状态与凭据

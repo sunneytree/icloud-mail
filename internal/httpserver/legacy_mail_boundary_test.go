@@ -243,6 +243,7 @@ func TestLegacyMailRecentConcurrentRequestsConsumeExactlyOnce(t *testing.T) {
 	type requestResult struct {
 		status int
 		body   string
+		reason string
 	}
 	start := make(chan struct{})
 	results := make(chan requestResult, requestCount)
@@ -253,7 +254,7 @@ func TestLegacyMailRecentConcurrentRequestsConsumeExactlyOnce(t *testing.T) {
 			defer requests.Done()
 			<-start
 			response := fixture.recent(t)
-			results <- requestResult{status: response.Code, body: response.Body.String()}
+			results <- requestResult{status: response.Code, body: response.Body.String(), reason: response.Header().Get("X-RateLimit-Reason")}
 		}()
 	}
 	close(start)
@@ -264,12 +265,22 @@ func TestLegacyMailRecentConcurrentRequestsConsumeExactlyOnce(t *testing.T) {
 	var unexpectedBodies []string
 	for result := range results {
 		statuses[result.status]++
-		if result.status != http.StatusOK && result.status != http.StatusTooManyRequests {
+		switch result.status {
+		case http.StatusOK:
+		case http.StatusTooManyRequests:
+			if result.reason != "mailbox_cooldown" || !strings.Contains(result.body, "RATE_LIMITED") {
+				unexpectedBodies = append(unexpectedBodies, result.body)
+			}
+		case http.StatusServiceUnavailable:
+			if result.reason != "mailbox_inflight" || !strings.Contains(result.body, "PICKUP_BUSY") {
+				unexpectedBodies = append(unexpectedBodies, result.body)
+			}
+		default:
 			unexpectedBodies = append(unexpectedBodies, result.body)
 		}
 	}
-	if statuses[http.StatusOK] != 1 || statuses[http.StatusTooManyRequests] != requestCount-1 || len(statuses) != 2 {
-		t.Fatalf("concurrent recent statuses = %v, want one 200 and %d 429 responses; unexpected bodies=%q",
+	if statuses[http.StatusOK] != 1 || statuses[http.StatusTooManyRequests]+statuses[http.StatusServiceUnavailable] != requestCount-1 || len(unexpectedBodies) != 0 {
+		t.Fatalf("concurrent recent statuses = %v, want one 200 and %d busy/cooldown responses; unexpected bodies=%q",
 			statuses, requestCount-1, unexpectedBodies)
 	}
 	if got := notifications.Load(); got != 1 {

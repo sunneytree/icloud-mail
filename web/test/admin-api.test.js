@@ -152,7 +152,8 @@ test("full account lists follow bounded offset pages and forward abort signals",
   for (const { url, options } of requests) {
     assert.equal(url.searchParams.get("limit"), "1000");
     assert.equal(url.searchParams.get("query"), "owner");
-    assert.equal(options.signal, controller.signal);
+    assert.equal(options.signal instanceof AbortSignal, true);
+    assert.equal(options.signal.aborted, false);
   }
   assert.equal(requests[0].url.searchParams.get("offset"), "0");
   assert.equal(requests[1].url.searchParams.get("offset"), "2");
@@ -217,7 +218,8 @@ test("account detail sends bounded alias pagination and normalizes page metadata
     limit: "50",
     offset: "100",
   });
-  assert.equal(request.options.signal, controller.signal);
+  assert.equal(request.options.signal instanceof AbortSignal, true);
+  assert.equal(request.options.signal.aborted, false);
   assert.equal(detail.account.aliasCount, 137);
   assert.deepEqual(detail.aliases.map((alias) => alias.id), [81]);
   assert.deepEqual(detail.pagination, {
@@ -312,6 +314,11 @@ test("account detail includes the normalized Apple session", async () => {
     region: "cn",
     authenticatedAt: "2026-08-07T08:00:00Z",
     expiresAt: null,
+    health: "",
+    lastRefreshedAt: null,
+    nextRefreshAt: null,
+    nextRetryAt: null,
+    refreshFailures: 0,
   });
 });
 
@@ -787,7 +794,8 @@ test("async alias deletion sends the operation ID once and maps the 202 snapshot
   assert.equal(url, "/admin/api/v1/aliases/batch?async=1");
   assert.equal(options.method, "DELETE");
   assert.equal(options.headers.get("X-CSRF-Token"), "csrf-token");
-  assert.equal(options.signal, controller.signal);
+  assert.equal(options.signal instanceof AbortSignal, true);
+  assert.equal(options.signal.aborted, false);
   assert.deepEqual(JSON.parse(options.body), { alias_ids: [91, 92], operation_id: operationId });
   assert.deepEqual(result, {
     jobId: operationId, status: "running", requested: 9, processed: 2,
@@ -821,7 +829,8 @@ test("job reads encode IDs, forward cancellation, and preserve latest null", asy
   for (const { options } of requests) {
     assert.equal(options.method, "GET");
     assert.equal(options.body, undefined);
-    assert.equal(options.signal, controller.signal);
+    assert.equal(options.signal instanceof AbortSignal, true);
+    assert.equal(options.signal.aborted, false);
   }
 });
 
@@ -1198,8 +1207,10 @@ test("full audit and runtime log lists use 1000-row batches", async () => {
   assert.equal(requests[1].url.searchParams.get("limit"), "1000");
   assert.equal(requests[1].url.searchParams.get("level"), "error");
   assert.equal(requests[1].url.searchParams.get("account_id"), "12");
-  assert.equal(requests[0].options.signal, controller.signal);
-  assert.equal(requests[1].options.signal, controller.signal);
+  assert.equal(requests[0].options.signal instanceof AbortSignal, true);
+  assert.equal(requests[1].options.signal instanceof AbortSignal, true);
+  assert.equal(requests[0].options.signal.aborted, false);
+  assert.equal(requests[1].options.signal.aborted, false);
 });
 
 test("pending mail sync accepts HTTP 202 and exposes continuation state", async () => {

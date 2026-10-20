@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"sync"
@@ -10,28 +11,34 @@ import (
 )
 
 const (
-	aliasDemandMinimumInterval = 2 * time.Second
-	pickupConcurrentLimit      = 16
-	pickupAccountLimit         = 2
-	pickupRateMaxEntries       = 8192
-	sharedPickupBurst          = 2
+	aliasDemandMinimumInterval  = 2 * time.Second
+	pickupConcurrentLimit       = 16
+	pickupAccountLimit          = 2
+	pickupRateMaxEntries        = 8192
+	sharedPickupBurst           = 2
+	sharedPickupConcurrentLimit = 512
+	sharedPickupWaitingLimit    = 384
+	sharedPickupQueueLimit      = 512
+	sharedPickupQueueTimeout    = 2 * time.Second
 )
 
 type aliasDemandRateState struct {
 	inFlight bool
+	readers  int
+	waiters  int
 	nextAt   time.Time
 	waiting  bool
 	credit   time.Duration
 	refilled time.Time
 }
 
-// Admission runs before credential locks and database authentication. Slots
-// bound the entire request, including slow upstream reads, with no wait queue.
+// Admission runs before credential locks and database authentication. Shared
+// readers wait briefly for capacity without multiplying upstream connections.
 func (s *Server) pickupAdmission() gin.HandlerFunc {
-	limit := pickupConcurrentLimit
 	if s.sharedMailboxReceiver {
-		limit = 128
+		return s.sharedPickupAdmission()
 	}
+	limit := pickupConcurrentLimit
 	slots := make(chan struct{}, limit)
 	rate := newWindowLimiter(100, time.Second)
 	return func(c *gin.Context) {
@@ -57,13 +64,91 @@ func (s *Server) pickupAdmission() gin.HandlerFunc {
 	}
 }
 
+func (s *Server) sharedPickupAdmission() gin.HandlerFunc {
+	return s.sharedPickupAdmissionWithCapacity(sharedPickupConcurrentLimit, sharedPickupWaitingLimit, sharedPickupQueueLimit, sharedPickupQueueTimeout)
+}
+
+func (s *Server) sharedPickupAdmissionWithCapacity(concurrentLimit, waitingLimit, queueLimit int, queueTimeout time.Duration) gin.HandlerFunc {
+	slots := make(chan struct{}, concurrentLimit)
+	waiters := make(chan struct{}, waitingLimit)
+	tickets := make(chan struct{}, concurrentLimit+queueLimit)
+	waitTickets := make(chan struct{}, waitingLimit+queueLimit/2)
+	return func(c *gin.Context) {
+		switch c.FullPath() {
+		case "/api/v1/otp", "/api/v1/mail/latest", "/api/v1/mail/recent", "/api/v1/mail/recent/", "/api/v1/pool/leases/:leaseID/code":
+		default:
+			c.Next()
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		wait, _ := strconv.Atoi(c.Query("wait_seconds"))
+		waiting := c.FullPath() == "/api/v1/pool/leases/:leaseID/code" && wait > 0
+		if waiting {
+			// Reserve ingress capacity as well as execution slots. A flood of
+			// queued long waits must not crowd out ordinary reads before admission.
+			select {
+			case waitTickets <- struct{}{}:
+				defer func() { <-waitTickets }()
+			default:
+				s.rejectMailboxPickup(c, "wait_queue", "等待新码请求较多，请稍后重试", time.Second)
+				return
+			}
+		}
+		select {
+		case tickets <- struct{}{}:
+			defer func() { <-tickets }()
+		default:
+			s.rejectMailboxPickup(c, "global_queue", "取件等待队列已满，请稍后重试", time.Second)
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), queueTimeout)
+		defer cancel()
+		acquire := func(semaphore chan struct{}, reason string) bool {
+			select {
+			case semaphore <- struct{}{}:
+				if ctx.Err() == nil {
+					return true
+				}
+				<-semaphore
+			case <-ctx.Done():
+			}
+			if c.Request.Context().Err() == nil {
+				s.rejectMailboxPickup(c, reason, "取件服务繁忙，请稍后重试", time.Second)
+			} else {
+				c.Abort()
+			}
+			return false
+		}
+		// Long waits cannot consume the capacity reserved for ordinary reads.
+		if waiting {
+			if !acquire(waiters, "wait_concurrency") {
+				return
+			}
+			defer func() { <-waiters }()
+		}
+		if !acquire(slots, "global_concurrency") {
+			return
+		}
+		defer func() { <-slots }()
+		if c.Request.Context().Err() != nil {
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
 func (s *Server) rejectMailboxPickup(c *gin.Context, reason, message string, retry time.Duration) {
 	retry = max(retry, time.Millisecond)
 	c.Header("Retry-After", strconv.FormatInt(int64((retry+time.Second-1)/time.Second), 10))
 	c.Header("X-Retry-After-Ms", strconv.FormatInt(int64((retry+time.Millisecond-1)/time.Millisecond), 10))
 	c.Header("X-RateLimit-Reason", reason)
 	c.Set("pickup_limit_reason", reason)
-	s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", message)
+	status, code := http.StatusServiceUnavailable, "PICKUP_BUSY"
+	if reason == "mailbox_rate" || reason == "mailbox_cooldown" || reason == "global_rate" {
+		status, code = http.StatusTooManyRequests, "RATE_LIMITED"
+	}
+	s.writeAPIError(c, status, code, message)
 	c.Abort()
 }
 
@@ -143,12 +228,6 @@ func (s *Server) beginSharedMailboxPickupLocked(c *gin.Context, accountID, alias
 	reason, message := "", ""
 	retry := time.Second
 	switch {
-	case waiting && state.waiting:
-		reason, message = "mailbox_waiting", "此邮箱已有等待新码请求，普通读取仍可使用"
-	case !waiting && state.inFlight:
-		reason, message = "mailbox_inflight", "此邮箱已有普通取件请求，请等待其完成"
-	case s.accountPickupActive[accountID] >= 64:
-		reason, message = "account_concurrency", "此主号取件请求已满，请稍后重试"
 	case !exists && len(s.aliasDemandRate) >= pickupRateMaxEntries:
 		reason, message = "mailbox_capacity", "取件邮箱较多，请稍后重试"
 	case state.credit < aliasDemandMinimumInterval:
@@ -163,8 +242,10 @@ func (s *Server) beginSharedMailboxPickupLocked(c *gin.Context, accountID, alias
 	state.credit -= aliasDemandMinimumInterval
 	state.nextAt = state.refilled.Add(capacity - state.credit)
 	if waiting {
+		state.waiters++
 		state.waiting = true
 	} else {
+		state.readers++
 		state.inFlight = true
 	}
 	s.aliasDemandRate[aliasID] = state
@@ -175,9 +256,11 @@ func (s *Server) beginSharedMailboxPickupLocked(c *gin.Context, accountID, alias
 		defer s.aliasDemandRateMu.Unlock()
 		current := s.aliasDemandRate[aliasID]
 		if waiting {
-			current.waiting = false
+			current.waiters--
+			current.waiting = current.waiters > 0
 		} else {
-			current.inFlight = false
+			current.readers--
+			current.inFlight = current.readers > 0
 		}
 		// Waiting, failures and cancellation do not restart a completion timer.
 		s.aliasDemandRate[aliasID] = current

@@ -135,6 +135,9 @@ func TestPoolAliasRetirementRequiresDualAuthAndIsProjectIsolated(t *testing.T) {
 	if _, accepted, err := env.store.StartPoolAliasRetirement(context.Background(), client.ID, "pool-retirement-http-status-0001", "fixture", []store.PoolAliasRetirementItemInput{{AliasID: lease.AliasID, LeaseID: lease.ID}}); err != nil || !accepted {
 		t.Fatalf("create status fixture accepted=%v err=%v", accepted, err)
 	}
+	if response := callPoolAliasRetirement(t, env, http.MethodPost, path, otherKey, map[string]any{"operation_id": "pool-retirement-http-status-0001", "items": []map[string]any{{"alias_id": lease.AliasID, "lease_id": lease.ID}}}, cookie, csrf); response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "IDEMPOTENCY_CONFLICT" {
+		t.Fatalf("cross project operation collision = %d %s", response.Code, response.Body.String())
+	}
 	statusPath := "/admin/api/v1/pool/aliases/batch/jobs/pool-retirement-http-status-0001"
 	if response := callPoolAliasRetirement(t, env, http.MethodGet, statusPath, otherKey, nil, cookie, ""); response.Code != http.StatusNotFound {
 		t.Fatalf("cross project status = %d %s", response.Code, response.Body.String())
@@ -216,7 +219,8 @@ func TestPoolAliasRetirementJobSuccessFailureAndIdempotency(t *testing.T) {
 
 func TestPoolAliasRetirementExplicitFailureRestoresAndUnknownStaysReview(t *testing.T) {
 	for name, deleteErr := range map[string]error{
-		"explicit":     errors.New("fixture Apple explicit failure"),
+		"explicit":     hmesync.ErrAccountDisabled,
+		"unclassified": errors.New("fixture transport outcome is unknown"),
 		"unknown":      hmesync.ErrUpstream,
 		"rate_limited": hmesync.ErrRateLimited,
 	} {

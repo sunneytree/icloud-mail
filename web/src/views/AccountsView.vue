@@ -25,7 +25,7 @@
     </SectionHeader>
 
     <div v-if="loading && accounts.length === 0" class="data-panel loading-panel">
-      <el-skeleton :rows="5" animated />
+      <el-skeleton :rows="5" animated role="status" aria-label="正在加载主号列表" />
     </div>
 
     <div v-else-if="loadError && accounts.length === 0" class="load-failed">

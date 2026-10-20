@@ -11,6 +11,19 @@ import (
 	"icloud-api/internal/domain"
 )
 
+func (s *Store) migrateActiveIMAPWindow(ctx context.Context, tx *sql.Tx) error {
+	_, err := s.txExecContext(ctx, tx, `
+		CREATE TABLE IF NOT EXISTS imap_active_windows (
+			account_id BIGINT PRIMARY KEY REFERENCES imap_sync_states(account_id) ON DELETE CASCADE,
+			uid_validity BIGINT NOT NULL,
+			since_at BIGINT NOT NULL CHECK(since_at > 0)
+		)`)
+	if err != nil {
+		return fmt.Errorf("migrate active IMAP windows: %w", err)
+	}
+	return nil
+}
+
 // GetIMAPSyncState returns the last atomically committed mailbox cursor for an
 // account.
 func (s *Store) GetIMAPSyncState(ctx context.Context, accountID int64) (domain.IMAPSyncState, error) {
@@ -20,12 +33,15 @@ func (s *Store) GetIMAPSyncState(ctx context.Context, accountID int64) (domain.I
 
 	var state domain.IMAPSyncState
 	var uidValidity, lastUID int64
-	var updatedAt int64
+	var updatedAt, windowSince int64
 	err := s.queryRowContext(ctx, `
-		SELECT account_id, uid_validity, last_uid, updated_at
-		FROM imap_sync_states
-		WHERE account_id = ?`, accountID,
-	).Scan(&state.AccountID, &uidValidity, &lastUID, &updatedAt)
+		SELECT state.account_id, state.uid_validity, state.last_uid, state.updated_at,
+		       COALESCE(active_window.since_at, 0)
+		FROM imap_sync_states state
+		LEFT JOIN imap_active_windows active_window ON active_window.account_id = state.account_id
+		    AND active_window.uid_validity = state.uid_validity
+		WHERE state.account_id = ?`, accountID,
+	).Scan(&state.AccountID, &uidValidity, &lastUID, &updatedAt, &windowSince)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return domain.IMAPSyncState{}, ErrNotFound
@@ -41,6 +57,9 @@ func (s *Store) GetIMAPSyncState(ctx context.Context, accountID int64) (domain.I
 	state.UIDValidity = uint32(uidValidity)
 	state.LastUID = uint32(lastUID)
 	state.UpdatedAt = timeFromTimestamp(updatedAt)
+	if windowSince != 0 {
+		state.ActiveWindowSince = timeFromTimestamp(windowSince)
+	}
 	return state, nil
 }
 
@@ -99,6 +118,16 @@ func (s *Store) ApplyMailboxSync(
 	result domain.MailboxSyncResult,
 	syncedAt time.Time,
 ) error {
+	return s.applyMailboxSync(ctx, accountID, expectedAccountVersion, nil, enabledAliases, result, syncedAt)
+}
+
+// ApplyObservedMailboxSync permits unrelated alias changes during network I/O.
+// Source configuration and each observed recipient are rechecked under the account row lock.
+func (s *Store) ApplyObservedMailboxSync(ctx context.Context, account domain.Account, aliases []domain.Alias, result domain.MailboxSyncResult, syncedAt time.Time) error {
+	return s.applyMailboxSync(ctx, account.ID, account.UpdatedAt, &account, aliases, result, syncedAt)
+}
+
+func (s *Store) applyMailboxSync(ctx context.Context, accountID int64, expectedAccountVersion time.Time, observed *domain.Account, enabledAliases []domain.Alias, result domain.MailboxSyncResult, syncedAt time.Time) error {
 	defer s.cleanupArchiveInputs(result.ArchivedMessages)
 	if expectedAccountVersion.IsZero() {
 		return fmt.Errorf("apply mailbox sync: expected account version is required")
@@ -108,10 +137,12 @@ func (s *Store) ApplyMailboxSync(
 	}
 	unlockArchive := s.lockMailArchiveAccount(accountID)
 	defer unlockArchive()
-	stagedArchive, err := s.stageArchiveMessages(result.ArchivedMessages)
+	stagedArchive, err := s.stageArchiveMessages(ctx, result.ArchivedMessages, true)
 	if err != nil {
 		return fmt.Errorf("stage mailbox archive: %w", err)
 	}
+	var discardedArchive map[string]stagedArchiveContent
+	defer func() { s.cleanupPublishedArchive(discardedArchive) }()
 	archiveCommitted := false
 	defer func() {
 		if !archiveCommitted {
@@ -137,17 +168,36 @@ func (s *Store) ApplyMailboxSync(
 	if err != nil {
 		return fmt.Errorf("lock account for mailbox sync: %w", err)
 	}
-	if accountVersion != timestamp(expectedAccountVersion) {
-		return nil
-	}
-	aliasesMatch, err := s.enabledAliasSetMatchesTx(ctx, tx, accountID, enabledAliases)
-	if err != nil {
-		return fmt.Errorf("recheck enabled aliases before mailbox publish: %w", err)
-	}
-	if !aliasesMatch {
-		// Alias mutations preserve the cursor but invalidate this publication's
-		// recipient set. Do not mark aliases it never observed as healthy.
-		return nil
+	if observed != nil {
+		if err := s.checkMailboxObservationTx(ctx, tx, *observed); err != nil {
+			return err
+		}
+		enabledAliases, result, err = s.filterMailboxRecipientsTx(ctx, tx, accountID, enabledAliases, result)
+		if err != nil {
+			return err
+		}
+		kept := make(map[string]bool, len(result.ArchivedMessages))
+		for _, message := range result.ArchivedMessages {
+			kept[archiveMessageKey(message)] = true
+		}
+		discardedArchive = make(map[string]stagedArchiveContent)
+		for key, content := range stagedArchive {
+			if !kept[key] {
+				discardedArchive[key] = content
+				delete(stagedArchive, key)
+			}
+		}
+	} else {
+		if accountVersion != timestamp(expectedAccountVersion) {
+			return nil
+		}
+		aliasesMatch, err := s.enabledAliasSetMatchesTx(ctx, tx, accountID, enabledAliases)
+		if err != nil {
+			return fmt.Errorf("recheck enabled aliases before mailbox publish: %w", err)
+		}
+		if !aliasesMatch {
+			return nil
+		}
 	}
 
 	var currentUIDValidity, currentLastUID, currentUpdatedAt int64
@@ -217,18 +267,36 @@ func (s *Store) ApplyMailboxSync(
 	); err != nil {
 		return fmt.Errorf("upsert IMAP sync state: %w", err)
 	}
+	if result.HasMore && !result.State.ActiveWindowSince.IsZero() {
+		if _, err := s.txExecContext(ctx, tx, `
+			INSERT INTO imap_active_windows(account_id, uid_validity, since_at)
+			VALUES(?, ?, ?)
+			ON CONFLICT(account_id) DO UPDATE SET
+				uid_validity = excluded.uid_validity, since_at = excluded.since_at`,
+			accountID, int64(result.State.UIDValidity), timestamp(result.State.ActiveWindowSince),
+		); err != nil {
+			return fmt.Errorf("upsert active IMAP window: %w", err)
+		}
+	} else if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_active_windows WHERE account_id = ?`, accountID); err != nil {
+		return fmt.Errorf("clear active IMAP window: %w", err)
+	}
 
 	syncStatus := domain.SyncStatusOK
 	if result.HasMore {
 		syncStatus = domain.SyncStatusPending
 	}
-	if _, err := s.txExecContext(ctx, tx, `
+	for start := 0; start < len(enabledAliases); start += 500 {
+		end := min(start+500, len(enabledAliases))
+		args := []any{syncStatus, timestamp(syncedAt), timestamp(syncedAt), accountID}
+		for _, alias := range enabledAliases[start:end] {
+			args = append(args, alias.ID)
+		}
+		if _, err := s.txExecContext(ctx, tx, `
 		UPDATE aliases
 		SET last_sync_status = ?, last_sync_error = '', last_synced_at = ?, updated_at = ?
-		WHERE account_id = ? AND enabled = TRUE`,
-		syncStatus, timestamp(syncedAt), timestamp(syncedAt), accountID,
-	); err != nil {
-		return fmt.Errorf("mark mailbox aliases synced: %w", err)
+		WHERE account_id = ? AND enabled = TRUE AND id IN (`+strings.TrimSuffix(strings.Repeat("?,", end-start), ",")+`)`, args...); err != nil {
+			return fmt.Errorf("mark mailbox aliases synced: %w", err)
+		}
 	}
 	nextAccountVersion, err := s.nextAccountVersion(accountVersion)
 	if err != nil {
@@ -251,6 +319,7 @@ func (s *Store) ApplyMailboxSync(
 		return fmt.Errorf("commit mailbox sync: %w", err)
 	}
 	archiveCommitted = true
+	s.cleanupSupersededArchive(ctx, stagedArchive)
 	if err := s.EnforceMailArchiveLimit(ctx); err != nil {
 		return fmt.Errorf("enforce mailbox archive limit: %w", err)
 	}
@@ -365,6 +434,14 @@ func (s *Store) RecordMailboxSyncFailure(
 	message string,
 	at time.Time,
 ) error {
+	return s.recordMailboxSyncFailure(ctx, accountID, expectedAccountVersion, nil, message, at)
+}
+
+func (s *Store) RecordObservedMailboxSyncFailure(ctx context.Context, account domain.Account, message string, at time.Time) error {
+	return s.recordMailboxSyncFailure(ctx, account.ID, account.UpdatedAt, &account, message, at)
+}
+
+func (s *Store) recordMailboxSyncFailure(ctx context.Context, accountID int64, expectedAccountVersion time.Time, observed *domain.Account, message string, at time.Time) error {
 	if accountID < 1 {
 		return fmt.Errorf("record mailbox sync failure: account ID must be positive")
 	}
@@ -390,7 +467,14 @@ func (s *Store) RecordMailboxSyncFailure(
 	if err != nil {
 		return fmt.Errorf("lock account for mailbox sync failure: %w", err)
 	}
-	if accountVersion != timestamp(expectedAccountVersion) {
+	if observed != nil {
+		if err := s.checkMailboxObservationTx(ctx, tx, *observed); err != nil {
+			if err == ErrAliasMailboxSyncStale {
+				return nil
+			}
+			return err
+		}
+	} else if accountVersion != timestamp(expectedAccountVersion) {
 		return nil
 	}
 

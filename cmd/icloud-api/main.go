@@ -166,6 +166,7 @@ func run() error {
 			return alias, createErr
 		},
 		logger,
+		autocreate.WithChannelAvailability(hmeService.CreationChannelAvailability),
 	)
 	if err != nil {
 		return fmt.Errorf("初始化隐私邮箱自动创建服务: %w", err)

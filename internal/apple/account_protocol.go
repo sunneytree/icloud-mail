@@ -606,6 +606,35 @@ func validAccountAliasAddress(address string) bool {
 	return len(parts) == 2 && parts[0] != "" && strings.EqualFold(parts[1], "icloud.com") && !strings.ContainsAny(address, " \r\n\t<>")
 }
 
+// GetAccountAlias verifies one completed address independently of Apple's list
+// projections, which can omit an address that the detail endpoint has activated.
+func (c *Client) GetAccountAlias(ctx context.Context, s AccountSession, expected Alias) (Alias, AccountSession, error) {
+	if s.APIKey == "" || s.SCNT == "" || s.RefreshRejected || !validAccountAliasAddress(expected.HME) ||
+		strings.TrimSpace(expected.AnonymousID) == "" || len(expected.AnonymousID) > 1024 {
+		return Alias{}, s, ErrInvalidSession
+	}
+	r, err := c.accountManagementCall(ctx, &s, http.MethodGet,
+		"/account/manage/email/private/"+url.PathEscape(expected.AnonymousID)+".em", nil)
+	if err != nil {
+		return Alias{}, s, err
+	}
+	var detail struct {
+		EmailAddress   string `json:"emailAddress"`
+		ID             string `json:"id"`
+		ForwardToEmail string `json:"forwardToEmail"`
+		Active         *bool  `json:"active"`
+		Exists         *bool  `json:"exists"`
+	}
+	if json.Unmarshal(r.body, &detail) != nil || detail.ID != expected.AnonymousID ||
+		!strings.EqualFold(detail.EmailAddress, expected.HME) || detail.Active == nil || !*detail.Active ||
+		detail.Exists == nil || !*detail.Exists || strings.TrimSpace(detail.ForwardToEmail) == "" {
+		return Alias{}, s, r.operationError("account alias detail response", ErrInvalidResponse, nil)
+	}
+	expected.IsActive = true
+	expected.ForwardToEmail = detail.ForwardToEmail
+	return expected, s, nil
+}
+
 func accountHashcash(ctx context.Context, bits int, challenge string) (string, error) {
 	if bits < 1 || bits > 24 || challenge == "" || len(challenge) > 1024 {
 		return "", operationError("account proof challenge", ErrInvalidResponse, 0, nil)

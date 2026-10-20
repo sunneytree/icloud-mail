@@ -194,21 +194,29 @@ func (s *Server) requestContext() gin.HandlerFunc {
 				key += " " + strconv.FormatInt(mailbox.Account.ID, 10)
 			}
 		}
-		if status == http.StatusTooManyRequests {
-			key = c.FullPath() + " rate_limited"
+		_, pickupReasonPresent := c.Get("pickup_limit_reason")
+		pickupBusy := status == http.StatusServiceUnavailable && pickupReasonPresent
+		if status == http.StatusTooManyRequests || pickupBusy {
+			category := " rate_limited"
+			if pickupBusy {
+				category = " pickup_busy"
+			}
+			key = c.FullPath() + category
 			if reason, ok := c.Get("pickup_limit_reason"); ok {
 				attrs = append(attrs, "limit_reason", reason, "retry_after_ms", c.Writer.Header().Get("X-Retry-After-Ms"))
 				key += " " + fmt.Sprint(reason)
 			}
 		}
-		if status == http.StatusTooManyRequests || c.Request.Method == http.MethodGet && status < http.StatusBadRequest && duration < time.Second {
+		if status == http.StatusTooManyRequests || pickupBusy || c.Request.Method == http.MethodGet && status < http.StatusBadRequest && duration < time.Second {
 			if ok, suppressed := sampler.allow(key, time.Now()); !ok {
 				return
 			} else if suppressed > 0 {
 				attrs = append(attrs, "suppressed_count", suppressed)
 			}
 		}
-		if status >= 500 {
+		if pickupBusy {
+			s.logger.Warn(operation, attrs...)
+		} else if status >= 500 {
 			s.logger.Error(operation, attrs...)
 		} else if status >= 400 && status != http.StatusTooManyRequests {
 			s.logger.Warn(operation, attrs...)

@@ -25,7 +25,7 @@ func (s *Store) migrateAliasIMAPSync(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("migrate alias IMAP sync states: %w", err)
 	}
-	return nil
+	return s.migrateActiveIMAPWindow(ctx, tx)
 }
 
 // GetAliasIMAPSyncState reads the independent cursor used by targeted fetches.
@@ -68,7 +68,7 @@ func (s *Store) ApplyAliasMailboxSync(
 	result domain.MailboxSyncResult,
 	syncedAt time.Time,
 ) error {
-	return s.applyAliasMailboxSync(ctx, expectedAccountVersion, alias, result, syncedAt, false)
+	return s.applyAliasMailboxSync(ctx, expectedAccountVersion, alias, result, syncedAt, false, nil)
 }
 
 // ApplyAliasWebMailboxSync publishes a bounded webmail observation without
@@ -80,7 +80,7 @@ func (s *Store) ApplyAliasWebMailboxSync(
 	result domain.MailboxSyncResult,
 	syncedAt time.Time,
 ) error {
-	return s.applyAliasMailboxSync(ctx, expectedAccountVersion, alias, result, syncedAt, true)
+	return s.applyAliasMailboxSync(ctx, expectedAccountVersion, alias, result, syncedAt, true, nil)
 }
 
 func (s *Store) applyAliasMailboxSync(
@@ -90,6 +90,7 @@ func (s *Store) applyAliasMailboxSync(
 	result domain.MailboxSyncResult,
 	syncedAt time.Time,
 	webmail bool,
+	observed *domain.Account,
 ) error {
 	defer s.cleanupArchiveInputs(result.ArchivedMessages)
 	if expectedAccountVersion.IsZero() {
@@ -107,7 +108,7 @@ func (s *Store) applyAliasMailboxSync(
 		}
 		result.ArchivedMessages = messages
 	}
-	stagedArchive, err := s.stageArchiveMessages(result.ArchivedMessages)
+	stagedArchive, err := s.stageArchiveMessages(ctx, result.ArchivedMessages, !webmail)
 	if err != nil {
 		return fmt.Errorf("stage alias mailbox archive: %w", err)
 	}
@@ -132,7 +133,18 @@ func (s *Store) applyAliasMailboxSync(
 	if err != nil {
 		return fmt.Errorf("lock account for alias mailbox sync: %w", err)
 	}
-	if accountVersion != timestamp(expectedAccountVersion) {
+	if observed != nil {
+		if err := s.checkMailboxObservationTx(ctx, tx, *observed); err != nil {
+			return err
+		}
+		aliases, _, err := s.filterMailboxRecipientsTx(ctx, tx, alias.AccountID, []domain.Alias{alias}, result)
+		if err != nil {
+			return err
+		}
+		if len(aliases) != 1 {
+			return ErrAliasMailboxSyncStale
+		}
+	} else if accountVersion != timestamp(expectedAccountVersion) {
 		return ErrAliasMailboxSyncStale
 	}
 	var accountEnabled, aliasEnabled bool
@@ -267,6 +279,7 @@ func (s *Store) applyAliasMailboxSync(
 		return fmt.Errorf("commit alias mailbox sync: %w", err)
 	}
 	archiveCommitted = true
+	s.cleanupSupersededArchive(ctx, stagedArchive)
 	if err := s.EnforceMailArchiveLimit(ctx); err != nil {
 		return fmt.Errorf("enforce alias mailbox archive limit: %w", err)
 	}

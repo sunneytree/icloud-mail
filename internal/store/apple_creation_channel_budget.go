@@ -64,9 +64,28 @@ func appleCreationChannelLimit(channel string) (int, bool) {
 	}
 }
 
+// Reading a completion cooldown must not consume another creation slot.
+func (s *Store) AppleCreationChannelPausedUntil(ctx context.Context, accountID int64, channel string) (time.Time, error) {
+	if _, ok := appleCreationChannelLimit(channel); !ok || accountID < 1 {
+		return time.Time{}, errors.New("invalid creation cooldown identity")
+	}
+	var until int64
+	err := s.queryRowContext(ctx, `SELECT until_at FROM apple_creation_channel_cooldowns WHERE account_id = ? AND channel = ?`, accountID, channel).Scan(&until)
+	if err == sql.ErrNoRows {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read creation channel cooldown: %w", err)
+	}
+	return timeFromTimestamp(until), nil
+}
+
 // ClaimAppleChannelCreationAttempt consumes one channel's rolling hourly budget.
 func (s *Store) ClaimAppleChannelCreationAttempt(ctx context.Context, accountID int64, channel string, now time.Time) error {
 	limit, ok := appleCreationChannelLimit(channel)
+	if channel == icloudWebCreationChannel && domain.WebOnlyCreation(ctx) {
+		limit = domain.ICloudWebOnlyCreationHourlyLimit
+	}
 	if accountID < 1 || now.IsZero() || !ok {
 		return errors.New("claim Apple channel creation attempt: invalid account or channel")
 	}

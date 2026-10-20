@@ -101,22 +101,31 @@ func (f *Fetcher) fetchArchiveIncremental(
 		Reset:     reset,
 		TargetUID: upperUID,
 	}
-	// Bound cold recovery, but never rewind a live cursor or skip its pending
-	// batches. Notifications and ordinary reads then fetch each new UID once.
-	if settings.activeRecent && (reset || syncedAt.Sub(previous.UpdatedAt) > settings.activeRecentWindow) {
-		boundary, hasMore, err := establishArchiveRecentCursor(ctx, client, mailbox.NumMessages, upperUID, settings.activeRecentCandidates)
+	windowSince := syncedAt.Add(-settings.activeRecentWindow)
+	pendingWindow := !reset && !previous.ActiveWindowSince.IsZero()
+	if pendingWindow {
+		windowSince = previous.ActiveWindowSince
+	}
+	// Recover by time, not by a fixed count of messages. Keep a pending window
+	// pinned until all of its batches commit, even after sleep or restart.
+	if settings.activeRecent && !pendingWindow && (reset || syncedAt.Sub(previous.UpdatedAt) > settings.activeRecentWindow) {
+		lastUID := uint32(0)
+		if !reset {
+			lastUID = previous.LastUID
+		}
+		boundary, err := establishActiveArchiveCursor(ctx, client, lastUID, upperUID, windowSince)
 		if err != nil {
 			return failure, fmt.Errorf("establish active recent cursor: %w", err)
 		}
-		if !reset && previous.LastUID > boundary {
-			boundary = previous.LastUID
-		}
-		result.State.LastUID, result.HasMore = boundary, hasMore
+		result.State.LastUID, result.HasMore = boundary, boundary < upperUID
 		result.RecoveryBoundaryUID = boundary
 		baseline := result.State
 		previous = &baseline
 	}
 	publish := func() (domain.MailboxSyncResult, error) {
+		if (settings.activeRecent || pendingWindow) && result.HasMore {
+			result.State.ActiveWindowSince = windowSince
+		}
 		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseValidating, 25)
 		updates, err := reconcileLegacySnapshotPositions(
 			ctx, client, snapshotPositions, mailbox.UIDValidity,
@@ -220,22 +229,24 @@ func (f *Fetcher) fetchArchiveIncremental(
 			}
 		}
 	}()
+	eligible := make([]archiveCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
 			return failure, err
 		}
-		if settings.activeRecent && candidate.internalDate.Before(syncedAt.Add(-settings.activeRecentWindow)) {
+		if (settings.activeRecent || pendingWindow) && candidate.internalDate.Before(windowSince) {
 			continue
 		}
-		archived, err := fetchArchivedMessage(client, candidate, account.ID, mailbox.UIDValidity, syncedAt, settings)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return failure, ctxErr
-			}
-			return failure, err
-		}
-		result.ArchivedMessages = append(result.ArchivedMessages, archived)
+		eligible = append(eligible, candidate)
 	}
+	archived, err := fetchArchivedMessages(client, eligible, account.ID, mailbox.UIDValidity, syncedAt, settings)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return failure, ctxErr
+		}
+		return failure, err
+	}
+	result.ArchivedMessages = append(result.ArchivedMessages, archived...)
 	published, err := publish()
 	if err != nil {
 		return failure, err
@@ -631,6 +642,72 @@ func fetchArchiveSequenceRange(client *imapclientv2.Client, first, last uint32, 
 	return messages, nil
 }
 
+// SINCE is a server-side date filter, not a timestamp comparison. Widen by
+// one day for INTERNALDATE timezones; candidate headers enforce the exact
+// timestamp before any body is read. ESEARCH keeps the response constant-size
+// where supported; rev1 peers return only the date-filtered UID metadata.
+func establishActiveArchiveCursor(ctx context.Context, client *imapclientv2.Client, lastUID, upperUID uint32, since time.Time) (uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return lastUID, err
+	}
+	if lastUID > upperUID {
+		return lastUID, errors.New("active archive cursor exceeds mailbox upper UID")
+	}
+	if lastUID == upperUID {
+		return upperUID, nil
+	}
+	set := imapv2.UIDSet{}
+	set.AddRange(imapv2.UID(lastUID+1), imapv2.UID(upperUID))
+	criteria := &imapv2.SearchCriteria{UID: []imapv2.UIDSet{set}, Since: since.UTC().AddDate(0, 0, -1)}
+	var options *imapv2.SearchOptions
+	if client.Caps().Has(imapv2.CapESearch) {
+		options = &imapv2.SearchOptions{ReturnMin: true, ReturnCount: true}
+	}
+	data, err := client.UIDSearch(criteria, options).Wait()
+	if err != nil {
+		return lastUID, err
+	}
+	if err := ctx.Err(); err != nil {
+		return lastUID, err
+	}
+	if data == nil {
+		return lastUID, errors.New("active archive search returned no response")
+	}
+	var first uint32
+	if options != nil {
+		first = data.Min
+		if (first == 0) != (data.Count == 0) {
+			return lastUID, errors.New("active archive search returned inconsistent minimum and count")
+		}
+		if uint64(data.Count) > uint64(upperUID)-uint64(lastUID) {
+			return lastUID, errors.New("active archive search returned an out-of-range count")
+		}
+	} else {
+		// Read the compact ranges directly rather than expanding a busy day's
+		// SEARCH result into an additional allocation per matching message.
+		set, ok := data.All.(imapv2.UIDSet)
+		if !ok || set.Dynamic() {
+			return lastUID, errors.New("active archive search returned an invalid UID set")
+		}
+		for _, span := range set {
+			lo, hi := min(uint32(span.Start), uint32(span.Stop)), max(uint32(span.Start), uint32(span.Stop))
+			if lo <= lastUID || hi > upperUID {
+				return lastUID, errors.New("active archive search returned an out-of-range UID")
+			}
+			if first == 0 || lo < first {
+				first = lo
+			}
+		}
+	}
+	if first == 0 {
+		return upperUID, nil
+	}
+	if first <= lastUID || first > upperUID {
+		return lastUID, errors.New("active archive search returned an out-of-range UID")
+	}
+	return first - 1, nil
+}
+
 // establishArchiveRecentCursor returns the UID immediately before a bounded
 // recent sequence window. It intentionally advances only the account cursor;
 // the next incremental batch examines all UIDs and fetches content. This
@@ -843,6 +920,222 @@ func classifyArchiveRecipientAliases(
 	return classifyICloudRecipientAliases(header, aliases, account, allowWeak)
 }
 
+// fetchArchivedMessages downloads all eligible literals in one UID FETCH.
+// Apple IMAP round trips dominate synchronization latency; one command per
+// bounded batch keeps progress and rollback bounded while avoiding a separate
+// FETCH for every matching message.
+func fetchArchivedMessages(
+	client *imapclientv2.Client,
+	candidates []archiveCandidate,
+	accountID int64,
+	uidValidity uint32,
+	syncedAt time.Time,
+	settings fetchSettings,
+) ([]domain.ArchivedMessage, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if settings.archiveTempDir == "" {
+		return nil, errors.New("mail archive temporary directory is not configured")
+	}
+	if err := os.MkdirAll(settings.archiveTempDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create mail archive temporary directory: %w", err)
+	}
+	byUID := make(map[uint32]archiveCandidate, len(candidates))
+	indexByUID := make(map[uint32]int, len(candidates))
+	result := make([]domain.ArchivedMessage, 0, len(candidates))
+	set := imapv2.UIDSet{}
+	fetchCount := 0
+	for _, candidate := range candidates {
+		if candidate.uid == 0 {
+			return nil, errors.New("archive candidate has empty UID")
+		}
+		if _, duplicate := byUID[candidate.uid]; duplicate {
+			return nil, fmt.Errorf("archive candidates contain duplicate UID %d", candidate.uid)
+		}
+		byUID[candidate.uid] = candidate
+		archived := domain.ArchivedMessage{
+			AccountID:    accountID,
+			UIDValidity:  uidValidity,
+			UID:          candidate.uid,
+			MessageID:    candidate.parsed.messageID,
+			InternalDate: candidate.internalDate,
+			HeaderDate:   candidate.parsed.headerDate,
+			From:         candidate.parsed.from,
+			To:           candidate.parsed.to,
+			CC:           candidate.parsed.cc,
+			Subject:      candidate.parsed.subject,
+			RawSize:      candidate.rawSize,
+			UpstreamSeen: candidate.upstreamSeen,
+			AliasIDs:     append([]int64(nil), candidate.aliasIDs...),
+			SyncedAt:     syncedAt,
+		}
+		if messageExceedsArchiveLimit(candidate.rawSize, settings.maxMessageBytes) {
+			archived.ContentState = domain.ArchiveContentOversized
+			archived.OTP = ExtractOTP(archived.Subject, "", "")
+		} else {
+			set.AddNum(imapv2.UID(candidate.uid))
+			fetchCount++
+		}
+		indexByUID[candidate.uid] = len(result)
+		result = append(result, archived)
+	}
+	if fetchCount == 0 {
+		return result, nil
+	}
+
+	command := client.Fetch(set, &imapv2.FetchOptions{
+		UID:          true,
+		InternalDate: true,
+		RFC822Size:   true,
+		BodySection:  []*imapv2.FetchItemBodySection{{Peek: true}},
+	})
+	defer command.Close()
+	found := make(map[uint32]bool, fetchCount)
+	staged := make(map[uint32]string, fetchCount)
+	var pendingPath string
+	cleanup := func() {
+		if pendingPath != "" {
+			_ = os.Remove(pendingPath)
+		}
+		for _, path := range staged {
+			_ = os.Remove(path)
+		}
+	}
+	for message := command.Next(); message != nil; message = command.Next() {
+		var uid uint32
+		var literalSize int64
+		var digest string
+		var internalDate time.Time
+		literalFound := false
+		for item := message.Next(); item != nil; item = message.Next() {
+			switch item := item.(type) {
+			case imapclientv2.FetchItemDataUID:
+				uid = uint32(item.UID)
+			case imapclientv2.FetchItemDataInternalDate:
+				internalDate = item.Time
+			case imapclientv2.FetchItemDataBodySection:
+				if item.Literal == nil {
+					continue
+				}
+				if literalFound {
+					_, _ = io.Copy(io.Discard, item.Literal)
+					cleanup()
+					return nil, errors.New("fetch archived message returned duplicate literal")
+				}
+				literalFound = true
+				literalSize = item.Literal.Size()
+				if messageExceedsArchiveLimit(literalSize, settings.maxMessageBytes) {
+					_, _ = io.Copy(io.Discard, item.Literal)
+					continue
+				}
+				path, stagedDigest, writeErr := writeArchiveLiteral(settings.archiveTempDir, item.Literal, literalSize)
+				if writeErr != nil {
+					cleanup()
+					return nil, writeErr
+				}
+				pendingPath = path
+				// UID may follow BODY in a valid IMAP response.
+				digest = stagedDigest
+			}
+		}
+		candidate, ok := byUID[uid]
+		if !ok || uid == 0 || messageExceedsArchiveLimit(candidate.rawSize, settings.maxMessageBytes) {
+			cleanup()
+			return nil, fmt.Errorf("fetch archived message returned unexpected UID %d", uid)
+		}
+		if found[uid] || !literalFound {
+			cleanup()
+			return nil, fmt.Errorf("fetch archived message UID %d returned duplicate or missing literal", uid)
+		}
+		archived := &result[indexByUID[uid]]
+		archived.RawSize = literalSize
+		if !internalDate.IsZero() {
+			archived.InternalDate = internalDate
+		}
+		if pendingPath == "" {
+			archived.ContentState = domain.ArchiveContentOversized
+			archived.OTP = ExtractOTP(archived.Subject, "", "")
+		} else {
+			staged[uid] = pendingPath
+			archived.RawMIMEPath = pendingPath
+			archived.RawSHA256 = digest
+			archived.ContentState = domain.ArchiveContentAvailable
+			pendingPath = ""
+		}
+		found[uid] = true
+	}
+	if err := command.Close(); err != nil {
+		cleanup()
+		if isUnsupportedBatchBodyFetch(err) {
+			return fetchArchivedMessagesIndividually(client, candidates, accountID, uidValidity, syncedAt, settings)
+		}
+		return nil, fmt.Errorf("fetch archived messages: %w", err)
+	}
+	for uid := range byUID {
+		if messageExceedsArchiveLimit(byUID[uid].rawSize, settings.maxMessageBytes) {
+			continue
+		}
+		if !found[uid] {
+			cleanup()
+			return nil, fmt.Errorf("fetch archived message UID %d returned no literal", uid)
+		}
+	}
+
+	limits := defaultMIMELimits(int64(settings.maxBodyBytes), int64(settings.maxParsedMessageBytes))
+	for uid, path := range staged {
+		file, err := os.Open(path)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("open staged MIME for parsing: %w", err)
+		}
+		parsed, parseErr := parseMIMEMessageReader(file, result[indexByUID[uid]].RawSize, limits)
+		closeErr := file.Close()
+		if parseErr != nil {
+			cleanup()
+			return nil, parseErr
+		}
+		if closeErr != nil {
+			cleanup()
+			return nil, closeErr
+		}
+		archived := &result[indexByUID[uid]]
+		projectParsedArchiveContent(archived, parsed)
+		archived.OTP = ExtractOTP(parsed.subject, parsed.textBody, parsed.htmlBody)
+	}
+	return result, nil
+}
+
+func isUnsupportedBatchBodyFetch(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "serverbug") || strings.Contains(message, "static uid")
+}
+
+func fetchArchivedMessagesIndividually(
+	client *imapclientv2.Client,
+	candidates []archiveCandidate,
+	accountID int64,
+	uidValidity uint32,
+	syncedAt time.Time,
+	settings fetchSettings,
+) ([]domain.ArchivedMessage, error) {
+	result := make([]domain.ArchivedMessage, 0, len(candidates))
+	for _, candidate := range candidates {
+		archived, err := fetchArchivedMessage(client, candidate, accountID, uidValidity, syncedAt, settings)
+		if err != nil {
+			for _, previous := range result {
+				if previous.RawMIMEPath != "" {
+					_ = os.Remove(previous.RawMIMEPath)
+				}
+			}
+			return nil, err
+		}
+		result = append(result, archived)
+	}
+	return result, nil
+}
+
+// fetchArchivedMessage handles the single-message compatibility fallback.
 func fetchArchivedMessage(
 	client *imapclientv2.Client,
 	candidate archiveCandidate,

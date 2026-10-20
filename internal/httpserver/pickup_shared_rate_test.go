@@ -95,12 +95,53 @@ func TestSharedPickupSlowReadEarnsCreditAndReleaseIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestSharedPickupAccountCapacityDoesNotConsumeOtherRootCredit(t *testing.T) {
+func TestSharedPickupConcurrentReadersReleaseOnlyTheirOwnReference(t *testing.T) {
+	for _, waiting := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "waiting"}[waiting], func(t *testing.T) {
+			env := newAdminAPITestEnv(t)
+			env.server.SetSharedMailboxReceiver(func(context.Context, int64) error { return nil })
+			now := time.Now()
+			env.server.now = func() time.Time { return now }
+			begin := func() (func(), bool) {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/otp", nil)
+				return env.server.beginMailboxPickupMode(c, 1, 1, waiting)
+			}
+			first, ok := begin()
+			if !ok {
+				t.Fatal("first reader blocked")
+			}
+			second, ok := begin()
+			if !ok {
+				t.Fatal("concurrent reader blocked despite available refresh credit")
+			}
+			first()
+			first()
+			state := env.server.aliasDemandRate[1]
+			if env.server.accountPickupActive[1] != 1 || waiting && (!state.waiting || state.waiters != 1) || !waiting && (!state.inFlight || state.readers != 1) {
+				t.Fatal("first completion cleared the concurrent reader")
+			}
+			now = now.Add(2 * time.Second)
+			third, ok := begin()
+			if !ok {
+				t.Fatal("in-flight reader blocked refilled refresh credit")
+			}
+			second()
+			third()
+			state = env.server.aliasDemandRate[1]
+			if state.inFlight || state.waiting || state.readers != 0 || state.waiters != 0 || env.server.accountPickupActive[1] != 0 {
+				t.Fatal("concurrent admission leaked a reference")
+			}
+		})
+	}
+}
+
+func TestSharedPickupTwoHundredRootsDoNotShareAnAccountLimit(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	now := time.Now()
 	env.server.now = func() time.Time { return now }
 	env.server.SetSharedMailboxReceiver(func(context.Context, int64) error { return nil })
-	releases := make([]func(), 0, 64)
+	releases := make([]func(), 0, 200)
 	begin := func(alias int64) (func(), bool, *httptest.ResponseRecorder) {
 		rec := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(rec)
@@ -108,7 +149,7 @@ func TestSharedPickupAccountCapacityDoesNotConsumeOtherRootCredit(t *testing.T) 
 		release, ok := env.server.beginMailboxPickup(c, 1, alias)
 		return release, ok, rec
 	}
-	for id := int64(1); id <= 64; id++ {
+	for id := int64(1); id <= 200; id++ {
 		release, ok, _ := begin(id)
 		if !ok {
 			t.Fatalf("account only admitted %d roots", id-1)
@@ -116,17 +157,21 @@ func TestSharedPickupAccountCapacityDoesNotConsumeOtherRootCredit(t *testing.T) 
 		releases = append(releases, release)
 		defer release()
 	}
+	duplicate, ok, _ := begin(1)
+	if !ok {
+		t.Fatal("same-root concurrent reader did not share the burst credit")
+	}
+	duplicate()
 	for i := 0; i < 5; i++ {
-		_, ok, rec := begin(65)
-		if ok || rec.Header().Get("X-RateLimit-Reason") != "account_concurrency" {
-			t.Fatal("account capacity not enforced")
+		_, ok, rec := begin(1)
+		if ok || rec.Header().Get("X-RateLimit-Reason") != "mailbox_rate" {
+			t.Fatal("same-root refresh rate not enforced")
 		}
 	}
-	releases[0]()
 	for i := 0; i < sharedPickupBurst; i++ {
-		release, ok, _ := begin(65)
+		release, ok, _ := begin(201)
 		if !ok {
-			t.Fatal("account rejections spent unrelated root credit")
+			t.Fatal("duplicate rejections spent unrelated root credit")
 		}
 		release()
 	}
@@ -206,10 +251,6 @@ func TestSharedPickupWaitAllowsNormalReadAndDoesNotAddCompletionCooldown(t *test
 				t.Fatal("reader did not wait")
 			}
 			elapsed.Store(int64(3 * time.Second))
-			duplicate := serveV2Request(router, http.MethodGet, path+"?wait_seconds=1", "", headers)
-			if duplicate.Code != 429 || duplicate.Header().Get("X-RateLimit-Reason") != "mailbox_waiting" {
-				t.Errorf("duplicate waiter: status=%d reason=%q", duplicate.Code, duplicate.Header().Get("X-RateLimit-Reason"))
-			}
 			read := serveV2Request(router, http.MethodGet, path, "", headers)
 			if read.Code != 200 {
 				t.Errorf("normal read blocked by waiter: %d", read.Code)

@@ -136,6 +136,11 @@ type SessionInfo struct {
 	Region          string
 	AuthenticatedAt *time.Time
 	ExpiresAt       *time.Time
+	Health          string
+	LastRefreshedAt *time.Time
+	NextRefreshAt   *time.Time
+	NextRetryAt     *time.Time
+	RefreshFailures int
 }
 
 type AuthResult struct {

@@ -142,6 +142,15 @@ func (s *Store) createAutoAliasCandidate(
 	if err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("insert automatic alias: %w", err)
 	}
+	if alias.CreationChannel != "" {
+		if _, ok := appleCreationChannelLimit(alias.CreationChannel); !ok || len(alias.CreationRemoteID) > 1024 {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("invalid automatic alias provenance")
+		}
+		if _, err := s.txExecContext(ctx, tx, `INSERT INTO apple_alias_creation_candidates(alias_id, channel, remote_id) VALUES (?, ?, ?)`,
+			aliasID, alias.CreationChannel, alias.CreationRemoteID); err != nil {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("save automatic alias provenance: %w", err)
+		}
+	}
 	if apiKeyCiphertext != "" && s.credentialReuseFactory != nil {
 		if err := s.installAliasCredentialMaterialTx(
 			ctx, tx, aliasID, 1, true, s.credentialReuseFactory,
@@ -200,21 +209,57 @@ func (s *Store) createAutoAliasCandidate(
 }
 
 func (s *Store) GetPendingAutoAliasConfirmation(ctx context.Context, accountID int64) (domain.PendingAliasAPIKey, error) {
+	return s.getPendingAutoAliasConfirmation(ctx, accountID, "")
+}
+
+// Unknown historical provenance gates both channels; known candidates gate only their own.
+func (s *Store) GetPendingAutoAliasConfirmationForChannel(ctx context.Context, accountID int64, channel string) (domain.PendingAliasAPIKey, error) {
+	if _, ok := appleCreationChannelLimit(channel); !ok {
+		return domain.PendingAliasAPIKey{}, fmt.Errorf("invalid pending creation channel")
+	}
+	return s.getPendingAutoAliasConfirmation(ctx, accountID, channel)
+}
+
+func (s *Store) getPendingAutoAliasConfirmation(ctx context.Context, accountID int64, channel string) (domain.PendingAliasAPIKey, error) {
 	if accountID < 1 {
 		return domain.PendingAliasAPIKey{}, fmt.Errorf("get pending automatic alias confirmation: account ID must be positive")
 	}
 	pending, err := scanPendingAliasAPIKey(s.queryRowContext(ctx, `
 		SELECT `+aliasColumns+`, p.api_key_ciphertext, p.created_at`+aliasJoins+`
 		JOIN pending_alias_api_keys p ON p.alias_id = al.id
+		LEFT JOIN apple_alias_creation_candidates c ON c.alias_id = al.id
 		WHERE al.account_id = ?
 		  AND al.enabled = FALSE
 		  AND al.last_sync_error = ?
+		  AND (? = '' OR c.channel IS NULL OR c.channel = ?)
 		ORDER BY p.created_at, al.id
-		LIMIT 1`, accountID, domain.AppleAliasConfirmationPending))
+		LIMIT 1`, accountID, domain.AppleAliasConfirmationPending, channel, channel))
 	if err != nil {
 		return domain.PendingAliasAPIKey{}, fmt.Errorf("get pending automatic alias confirmation: %w", err)
 	}
+	err = s.queryRowContext(ctx, `SELECT channel, remote_id FROM apple_alias_creation_candidates WHERE alias_id = ?`, pending.ID).
+		Scan(&pending.CreationChannel, &pending.CreationRemoteID)
+	if err != nil && err != sql.ErrNoRows {
+		return domain.PendingAliasAPIKey{}, fmt.Errorf("read pending creation provenance: %w", err)
+	}
 	return pending, nil
+}
+
+// SaveAliasCreationCandidateDetail checkpoints an exact completed candidate before detail reads.
+func (s *Store) SaveAliasCreationCandidateDetail(ctx context.Context, accountID, aliasID int64, channel, remoteID string) error {
+	if _, ok := appleCreationChannelLimit(channel); !ok || remoteID == "" || len(remoteID) > 1024 {
+		return fmt.Errorf("invalid candidate detail checkpoint")
+	}
+	result, err := s.execContext(ctx, `INSERT INTO apple_alias_creation_candidates(alias_id, channel, remote_id)
+		SELECT id, ?, ? FROM aliases WHERE id = ? AND account_id = ? AND enabled = FALSE AND last_sync_error = ?
+		ON CONFLICT(alias_id) DO UPDATE SET remote_id = excluded.remote_id
+		WHERE apple_alias_creation_candidates.channel = excluded.channel
+		AND (apple_alias_creation_candidates.remote_id = '' OR apple_alias_creation_candidates.remote_id = excluded.remote_id)`,
+		channel, remoteID, aliasID, accountID, domain.AppleAliasConfirmationPending)
+	if err != nil {
+		return fmt.Errorf("checkpoint pending candidate detail: %w", err)
+	}
+	return requireAffected(result, "pending candidate provenance")
 }
 
 // DiscardStalePendingAutoAlias releases a local reserve marker only after its

@@ -321,6 +321,11 @@ export function normalizeAppleSession(raw) {
       ) || null,
     expiresAt:
       firstDefined(raw, "expires_at", "expiresAt", "ExpiresAt") || null,
+    health: firstDefined(raw, "health", "Health") || "",
+    lastRefreshedAt: firstDefined(raw, "last_refreshed_at", "lastRefreshedAt", "LastRefreshedAt") || null,
+    nextRefreshAt: firstDefined(raw, "next_refresh_at", "nextRefreshAt", "NextRefreshAt") || null,
+    nextRetryAt: firstDefined(raw, "next_retry_at", "nextRetryAt", "NextRetryAt") || null,
+    refreshFailures: Number(firstDefined(raw, "refresh_failures", "refreshFailures", "RefreshFailures") || 0),
   };
 }
 

@@ -12,8 +12,72 @@ import (
 	"testing"
 	"time"
 
+	"icloud-api/internal/domain"
 	"icloud-api/internal/store"
 )
+
+func TestAppleCreationWebOnlySwitchPreservesRollingHistoryAndCooldown(t *testing.T) {
+	db := openTestStore(t)
+	checkWebOnlySwitch(t, db)
+}
+
+func TestAppleCreationWebOnlyPostgresSwitch(t *testing.T) {
+	dsn := os.Getenv("ICLOUD_TEST_POSTGRES_URL")
+	if dsn == "" {
+		t.Skip("ICLOUD_TEST_POSTGRES_URL is not set")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Hostname() != "127.0.0.1" || !strings.Contains(u.Path, "test") {
+		t.Fatal("expected disposable loopback test database")
+	}
+	db, err := store.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	checkWebOnlySwitch(t, db)
+}
+
+func checkWebOnlySwitch(t *testing.T, db *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	degraded := domain.WithWebOnlyCreation(ctx)
+	a := createAccount(t, ctx, db, "degraded channel", "degraded@icloud.com")
+	now := time.Date(2026, 10, 14, 1, 0, 0, 0, time.UTC)
+	for i := range 4 {
+		if err := db.ClaimAppleChannelCreationAttempt(ctx, a.ID, "icloud_web", now.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.ClaimAppleChannelCreationAttempt(degraded, a.ID, "icloud_web", now.Add(4*time.Minute)); err != nil {
+		t.Fatalf("fifth Web-only slot: %v", err)
+	}
+	if err := db.ClaimAppleChannelCreationAttempt(degraded, a.ID, "icloud_web", now.Add(5*time.Minute)); !isAppleBudgetWait(err) {
+		t.Fatalf("sixth degraded attempt=%v", err)
+	}
+	if err := db.ClaimAppleChannelCreationAttempt(ctx, a.ID, "icloud_web", now.Add(6*time.Minute)); !isAppleBudgetWait(err) {
+		t.Fatalf("relogin cleared history=%v", err)
+	}
+	if err := db.ClaimAppleChannelCreationAttempt(ctx, a.ID, "apple_account", now.Add(6*time.Minute)); err != nil {
+		t.Fatalf("ACC blocked=%v", err)
+	}
+	until := now.Add(2 * time.Hour)
+	if err := db.PauseAppleChannelCreation(ctx, a.ID, "icloud_web", until); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ClaimAppleChannelCreationAttempt(degraded, a.ID, "icloud_web", now.Add(time.Hour)); !isAppleBudgetWait(err) || !budgetUntil(err).Equal(until) {
+		t.Fatalf("degrade bypassed cooldown=%v", err)
+	}
+	if err := db.ClaimAppleChannelCreationAttempt(degraded, a.ID, "icloud_web", until); err != nil {
+		t.Fatalf("cooldown boundary=%v", err)
+	}
+}
 
 func TestAppleCreationChannelsHaveIndependentLimitsAndRollingBoundary(t *testing.T) {
 	db := openTestStore(t)

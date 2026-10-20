@@ -328,7 +328,7 @@
       />
 
     <div v-if="loading && aliases.length === 0" class="data-panel loading-panel">
-      <el-skeleton :rows="6" animated />
+      <el-skeleton :rows="6" animated role="status" aria-label="正在加载隐私邮箱列表" />
     </div>
 
     <div v-else-if="loadError && aliases.length === 0" class="load-failed">

@@ -140,6 +140,10 @@ router.afterEach((to) => {
   }
 });
 
+router.onError(() => {
+  window.dispatchEvent(new Event("icloud:startup-error"));
+});
+
 setUnauthorizedHandler((error) => {
   const current = router.currentRoute.value;
   auth.clearSession({ errorCode: error?.code || "" });

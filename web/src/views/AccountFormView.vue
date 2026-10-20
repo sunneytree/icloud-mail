@@ -1,6 +1,6 @@
 <template>
   <section class="content-narrow page-stack account-form-page">
-    <div v-if="loading" class="form-panel loading-panel">
+    <div v-if="loading" class="form-panel loading-panel" role="status" aria-live="polite" aria-busy="true" aria-label="正在加载主号表单">
       <el-skeleton :rows="7" animated />
     </div>
 

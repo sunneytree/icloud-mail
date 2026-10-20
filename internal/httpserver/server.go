@@ -45,7 +45,7 @@ type Server struct {
 	mailSyncWakeMu          sync.Mutex
 	mailSyncWake            map[int64]time.Time
 	credentialRotationMu    sync.RWMutex
-	poolMu                  sync.Mutex
+	poolMu                  sync.RWMutex
 	manualAliasMu           sync.Mutex
 	manualAliasesRunning    map[int64]bool
 	manualProbesRunning     map[int64]bool
@@ -341,7 +341,7 @@ func (s *Server) registerAdminSPA(router *gin.Engine) {
 
 func (s *Server) serveAdminIndex(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Header("Cache-Control", "no-store, private")
+	c.Header("Cache-Control", "no-store, private, no-transform")
 	c.Header("CDN-Cache-Control", "no-store")
 	c.Writer.Header().Add("Vary", "Cookie")
 	if c.Request.Method == http.MethodHead {

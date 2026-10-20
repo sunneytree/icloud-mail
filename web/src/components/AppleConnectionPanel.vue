@@ -1,16 +1,18 @@
 <template>
   <div class="apple-connection-panel">
-    <el-tag :type="accountAuthenticated ? 'success' : 'info'" effect="plain">新建连接：{{ statusLabel }}</el-tag>
+    <el-tag :type="session?.health === 'retry_wait' ? 'warning' : accountAuthenticated ? 'success' : 'info'" effect="plain">新建连接：{{ statusLabel }}</el-tag>
     <el-tag :type="webAuthenticated ? 'success' : 'info'" effect="plain">目录连接：{{ webAuthenticated ? '已登录' : '未登录' }}</el-tag>
     <el-button class="apple-connection-panel__manage" :disabled="busy || loading" @click="openManager">管理 Apple 连接</el-button>
     <el-dialog v-model="visible" title="管理 Apple 连接" width="min(500px, calc(100vw - 28px))" :close-on-click-modal="false" :before-close="closeManager">
       <RequestAlert v-if="error" :error="error" closable @close="error = null" />
-      <p class="field-help">新建优先使用 Apple Account；目录同步、转发核对、停用和删除使用 iCloud Web。两套会话独立保存，分别验证，退出其中一个不会退出另一个。</p>
+      <p class="field-help">新建优先使用 Apple Account；同步目录优先使用 iCloud Web，目录登录失效时可使用已登录的 Apple Account 读取。转发核对、停用和删除仍使用 iCloud Web。两套会话独立保存，分别验证，退出其中一个不会退出另一个。</p>
       <p class="field-help">登录仅配置连接，不会启用已停用的主号，也不会自动创建邮箱。</p>
       <template v-if="step === 'manage'">
         <section class="apple-connection-panel__channel">
           <h3>新建连接 · Apple Account</h3>
           <p class="field-help">{{ statusLabel }}<template v-if="session?.appleId"> · {{ session.appleId }}</template></p>
+          <p v-if="session?.health === 'retry_wait'" class="field-help">续期暂未完成，已保留会话并安排重试<template v-if="session.nextRetryAt">：{{ connectionTime(session.nextRetryAt) }}</template>。只有 Apple 明确判定登录失效才需要重新登录。</p>
+          <p v-if="session?.lastRefreshedAt" class="field-help">最近续期：{{ connectionTime(session.lastRefreshedAt) }}<template v-if="session.nextRefreshAt"> · 下次计划：{{ connectionTime(session.nextRefreshAt) }}</template></p>
           <div class="apple-connection-panel__actions">
             <el-button type="primary" :disabled="blocked" @click="openLogin">{{ accountAuthenticated ? '重新登录新建连接' : '登录新建连接' }}</el-button>
             <el-button v-if="accountAuthenticated" :disabled="blocked" @click="logoutAccount">退出新建连接</el-button>
@@ -54,7 +56,8 @@ const emit = defineEmits(["busy", "session-change", "open-web-login", "disconnec
 const visible = ref(false), loading = ref(false), error = ref(null), session = ref(null), step = ref("manage");
 const appleId = ref(""), password = ref(""), region = ref("global"), code = ref(""), challengeId = ref("");
 const accountAuthenticated = computed(() => session.value?.status === "authenticated");
-const statusLabel = computed(() => ({ authenticated: "已登录", expired: "需重新登录", verification_required: "待验证" }[session.value?.status] || "未登录"));
+const statusLabel = computed(() => session.value?.health === "retry_wait" ? "等待续期重试" : ({ authenticated: "已登录", expired: "需重新登录", verification_required: "待验证" }[session.value?.status] || "未登录"));
+function connectionTime(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? "待确认" : date.toLocaleString("zh-CN", { hour12: false }); }
 const blocked = computed(() => props.busy || loading.value);
 let alive = true, generation = 0, sessionRequest = 0;
 function guard() { const g = generation, id = props.accountId; return () => alive && g === generation && id === props.accountId; }

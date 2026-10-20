@@ -16,7 +16,7 @@
       title="后台导航"
       append-to-body
     >
-      <div class="mobile-drawer__inner" aria-label="后台导航">
+      <div id="mobile-admin-navigation" class="mobile-drawer__inner" aria-label="后台导航">
         <AppBrand />
         <AdminNavigation @navigate="drawerOpen = false" />
         <SidebarFooter />
@@ -30,6 +30,7 @@
           :icon="Menu"
           aria-label="打开导航"
           :aria-expanded="drawerOpen"
+          aria-controls="mobile-admin-navigation"
           circle
           @click="drawerOpen = true"
         />
@@ -148,17 +149,17 @@ const SidebarFooter = defineComponent({
           [h(ChatDotRound, { "aria-hidden": "true" }), h("span", "QQ 群 1105888476")],
         ),
         h("div", { class: "admin-sidebar__footer-main" }, [
-        h("span", { class: "admin-sidebar__username", title: auth.state.username }, auth.state.username),
-        h(
-          "button",
-          {
-            type: "button",
-            class: "quiet-action",
-            disabled: logoutLoading.value,
-            onClick: performLogout,
-          },
-          [h(SwitchButton, { "aria-hidden": "true" }), h("span", logoutLoading.value ? "退出中" : "退出")],
-        ),
+          h("span", { class: "admin-sidebar__username", title: auth.state.username }, auth.state.username),
+          h(
+            "button",
+            {
+              type: "button",
+              class: "quiet-action",
+              disabled: logoutLoading.value,
+              onClick: performLogout,
+            },
+            [h(SwitchButton, { "aria-hidden": "true" }), h("span", logoutLoading.value ? "退出中" : "退出")],
+          ),
         ]),
       ]);
   },

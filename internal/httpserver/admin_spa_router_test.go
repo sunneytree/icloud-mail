@@ -48,7 +48,7 @@ func TestAdminSPARandomPathAssetsAndAPIBoundaries(t *testing.T) {
 			!strings.Contains(response.Body.String(), `<base href="`+adminPath+`/">`) {
 			t.Fatalf("GET %s = %d body=%s", target, response.Code, response.Body.String())
 		}
-		if response.Header().Get("Cache-Control") != "no-store, private" {
+		if response.Header().Get("Cache-Control") != "no-store, private, no-transform" {
 			t.Fatalf("GET %s Cache-Control=%q", target, response.Header().Get("Cache-Control"))
 		}
 	}

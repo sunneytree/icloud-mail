@@ -53,7 +53,37 @@ function fallbackHTTPError(status) {
   return {};
 }
 
+// Bound both header and body waits. Abort the transport without replaying writes.
 export async function apiRequest(path, options = {}) {
+  const timeoutMs = options.timeoutMs ?? (String(options.method || "GET").toUpperCase() === "GET" ? 15_000 : 120_000);
+  const controller = new AbortController();
+  const upstream = options.signal;
+  const abort = () => controller.abort(upstream.reason);
+  if (upstream?.aborted) abort();
+  else upstream?.addEventListener("abort", abort, { once: true });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    return await requestWithSignal(path, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      throw new ApiError({
+        status: 0,
+        code: "REQUEST_TIMEOUT",
+        message: "网络响应超时，请稍后重试。已提交的操作请先查看执行状态。",
+      });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    upstream?.removeEventListener("abort", abort);
+  }
+}
+
+async function requestWithSignal(path, options = {}) {
   const {
     method = "GET",
     body,
@@ -80,6 +110,9 @@ export async function apiRequest(path, options = {}) {
       signal,
     });
   } catch (error) {
+    if (signal?.aborted) {
+      throw new DOMException("Request aborted", "AbortError");
+    }
     if (error?.name === "AbortError") {
       throw error;
     }
@@ -94,6 +127,7 @@ export async function apiRequest(path, options = {}) {
   try {
     payload = await parsePayload(response);
   } catch {
+    if (signal?.aborted) throw new DOMException("Request aborted", "AbortError");
     throw new ApiError({
       status: response.status,
       code: "INVALID_RESPONSE",

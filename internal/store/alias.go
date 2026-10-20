@@ -23,7 +23,8 @@ const aliasColumns = `
 	(SELECT MAX(m.internal_date)
 	 FROM alias_messages am
 	 JOIN archived_messages m ON m.id = am.message_id
-	 WHERE am.alias_id = al.id), NOT ac.enabled`
+	 WHERE am.alias_id = al.id), NOT ac.enabled,
+	COALESCE((SELECT revision FROM alias_receive_revisions WHERE alias_id = al.id), 0)`
 
 const aliasJoins = `
 	FROM aliases al
@@ -658,6 +659,7 @@ func scanAlias(scanner rowScanner) (domain.Alias, error) {
 		&enabled, &alias.LastSyncStatus,
 		&alias.LastSyncError, &lastSyncedAt, &lastAccessedAt,
 		&createdAt, &updatedAt, &latestReceivedAt, &alias.AccountDisabled,
+		&alias.ReceiveRevision,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {

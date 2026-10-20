@@ -20,6 +20,10 @@ const accountColumns = `
 		WHERE ams.account_id = a.id), 'icloud') AS mailbox_type,
 	COALESCE((SELECT ams.email_suffix FROM account_mailbox_settings ams
 		WHERE ams.account_id = a.id), '') AS email_suffix,
+	COALESCE((SELECT ams.updated_at FROM account_mailbox_settings ams
+		WHERE ams.account_id = a.id), 0),
+	COALESCE((SELECT amt.updated_at FROM account_mail_transports amt
+		WHERE amt.account_id = a.id), 0),
 	COALESCE((SELECT afp.verify_forwarding_target FROM account_forwarding_policy afp
 		WHERE afp.account_id = a.id), FALSE) AS verify_forwarding_target`
 
@@ -121,6 +125,7 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	var currentEnabled bool
 	var currentEmail, currentHost, currentUsername string
 	var currentMailboxType, currentEmailSuffix string
+	var currentMailboxVersion int64
 	var currentPort int
 	var hasAliases bool
 	if err := s.txQueryRowContext(ctx, tx, `
@@ -129,9 +134,11 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 		       COALESCE((SELECT mailbox_type FROM account_mailbox_settings
 			WHERE account_id = accounts.id), 'icloud'),
 		       COALESCE((SELECT email_suffix FROM account_mailbox_settings
-			WHERE account_id = accounts.id), '')
+			WHERE account_id = accounts.id), ''),
+		       COALESCE((SELECT updated_at FROM account_mailbox_settings
+			WHERE account_id = accounts.id), 0)
 		FROM accounts WHERE id = ?`, account.ID,
-	).Scan(&currentPassword, &currentEnabled, &currentEmail, &currentHost, &currentPort, &currentUsername, &hasAliases, &currentMailboxType, &currentEmailSuffix); err != nil {
+	).Scan(&currentPassword, &currentEnabled, &currentEmail, &currentHost, &currentPort, &currentUsername, &hasAliases, &currentMailboxType, &currentEmailSuffix, &currentMailboxVersion); err != nil {
 		if err == sql.ErrNoRows {
 			return domain.Account{}, ErrNotFound
 		}
@@ -199,7 +206,13 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	if err := requireAffected(result, "account"); err != nil {
 		return domain.Account{}, err
 	}
-	if err := s.upsertAccountMailboxSettingsTx(ctx, tx, account.ID, requestedMailboxType, requestedEmailSuffix, nextAccountVersion); err != nil {
+	mailboxVersion := currentMailboxVersion
+	if emailChanged || usernameChanged || mailboxSettingsChanged || currentEnabled != account.Enabled ||
+		requestedHost != strings.TrimSpace(currentHost) || account.IMAPPort != currentPort ||
+		account.PasswordCiphertext != "" && account.PasswordCiphertext != currentPassword {
+		mailboxVersion = nextAccountVersion
+	}
+	if err := s.upsertAccountMailboxSettingsTx(ctx, tx, account.ID, requestedMailboxType, requestedEmailSuffix, mailboxVersion); err != nil {
 		return domain.Account{}, fmt.Errorf("update account mailbox settings: %w", err)
 	}
 	reenabled := !currentEnabled && account.Enabled
@@ -630,7 +643,9 @@ func scanAccount(scanner rowScanner) (domain.Account, error) {
 		&account.IMAPUsername, &account.PasswordCiphertext, &enabled,
 		&account.LastSyncStatus, &account.LastSyncError, &lastSyncedAt,
 		&createdAt, &updatedAt, &account.AliasCount,
-		&account.MailboxType, &account.EmailSuffix, &verifyForwardingTarget,
+		&account.MailboxType, &account.EmailSuffix,
+		&account.MailboxConfigVersion, &account.MailTransportVersion,
+		&verifyForwardingTarget,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {

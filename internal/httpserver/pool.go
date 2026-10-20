@@ -324,6 +324,13 @@ func (s *Server) poolLeaseCode(c *gin.Context) {
 	}
 	if s.demandAliasSync != nil {
 		if err := s.demandAliasSync(waitCtx, alias.ID); err != nil {
+			if c.Request.Context().Err() != nil {
+				return
+			}
+			if wait > 0 && waitCtx.Err() != nil {
+				s.writePoolCodeIfReady(c, v, alias, account, after, true)
+				return
+			}
 			c.Header("Retry-After", "3")
 			s.writeAPIError(c, http.StatusServiceUnavailable, "SYNC_UNAVAILABLE", "本次按需取件尚未完成，请稍后刷新取件地址")
 			return
@@ -397,8 +404,8 @@ func (s *Server) writePoolCodeIfReady(c *gin.Context, v store.PoolLease, alias d
 	// against pool key rotation and lease changes.
 	s.credentialRotationMu.RLock()
 	defer s.credentialRotationMu.RUnlock()
-	s.poolMu.Lock()
-	defer s.poolMu.Unlock()
+	s.poolMu.RLock()
+	defer s.poolMu.RUnlock()
 	token, _ := strictBearerToken(c.Request)
 	currentClient, err := s.store.AuthenticatePoolClient(c.Request.Context(), token)
 	if errors.Is(err, store.ErrNotFound) || err == nil && currentClient.ID != poolClient(c).ID {

@@ -125,7 +125,7 @@ func TestPickupRateInFlightBlocksSameAliasButAllowsOtherAliasAndHealth(t *testin
 		t.Fatal("callback did not start")
 	}
 	dup := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{"Authorization": "Bearer " + firstCreds.APIKey})
-	if dup.Code != http.StatusTooManyRequests {
+	if dup.Code != http.StatusServiceUnavailable {
 		t.Fatalf("same alias in-flight = %d", dup.Code)
 	}
 	other := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{"Authorization": "Bearer " + secondCreds.APIKey})
@@ -172,7 +172,7 @@ func TestPickupRateGlobalSixteenSlotsRejectSeventeenthAndLeavesHealth(t *testing
 	}()
 	select {
 	case code := <-results:
-		if code != http.StatusTooManyRequests {
+		if code != http.StatusServiceUnavailable {
 			t.Fatalf("full ingress status=%d", code)
 		}
 	case <-time.After(time.Second):
@@ -224,7 +224,7 @@ func TestPickupRateLimitsPendingReadsPerAccount(t *testing.T) {
 			t.Fatal("account pickup did not start")
 		}
 	}
-	if got := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{"Authorization": "Bearer " + third.APIKey}); got.Code != http.StatusTooManyRequests {
+	if got := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{"Authorization": "Bearer " + third.APIKey}); got.Code != http.StatusServiceUnavailable {
 		t.Fatalf("third account pickup status=%d", got.Code)
 	}
 	if got := serveV2Request(router, http.MethodGet, "/api/v1/otp", "", map[string]string{"Authorization": "Bearer " + independent.APIKey}); got.Code != http.StatusOK {

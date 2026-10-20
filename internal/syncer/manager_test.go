@@ -422,7 +422,7 @@ func TestAutomaticContinuationWaitTimeoutDefersWithSameRunID(t *testing.T) {
 		t.Fatalf("first automatic run ID missing: %#v", firstEntries)
 	}
 
-	release, err := manager.acquireAccount(context.Background(), account.ID)
+	release, err := manager.acquireIMAPAccountUntil(context.Background(), nil, account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -916,7 +916,7 @@ func TestQueueAccountSyncWaitsForResourcesWithoutDropping(t *testing.T) {
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
 	manager.SetSyncTimeout(20 * time.Millisecond)
-	releaseBusy, err := manager.acquireAccount(context.Background(), account.ID)
+	releaseBusy, err := manager.acquireIMAPAccountUntil(context.Background(), nil, account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1317,7 +1317,7 @@ func TestSyncAccountWithTimeoutStartsFreshWorkBudgetAfterQueueing(t *testing.T) 
 		return context.WithTimeout(ctx, timeout)
 	}
 
-	releaseAccount, err := manager.acquireAccount(context.Background(), account.ID)
+	releaseAccount, err := manager.acquireIMAPAccountUntil(context.Background(), nil, account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1501,7 +1501,7 @@ func TestFailureRecorderKeepsDetailedUnicodeErrorWithinBound(t *testing.T) {
 	}
 }
 
-func TestAccountLockSerializesConfigurationWithSync(t *testing.T) {
+func TestAccountManagementLockAllowsParallelIMAP(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	fetchStarted := make(chan struct{}, 1)
@@ -1526,17 +1526,12 @@ func TestAccountLockSerializesConfigurationWithSync(t *testing.T) {
 	go func() { syncDone <- manager.SyncAccount(context.Background(), account.ID) }()
 	select {
 	case <-fetchStarted:
-		t.Fatal("同步越过了主号配置锁")
-	case <-time.After(30 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("IMAP network work waited for Apple management lock")
 	}
 	close(releaseLock)
 	if err := <-mutationDone; err != nil {
 		t.Fatalf("配置操作失败: %v", err)
-	}
-	select {
-	case <-fetchStarted:
-	case <-time.After(time.Second):
-		t.Fatal("释放配置锁后同步未启动")
 	}
 	if err := <-syncDone; err != nil {
 		t.Fatalf("释放配置锁后的同步失败: %v", err)
@@ -1560,7 +1555,7 @@ func TestSyncAllSkipsBusyAccountWithoutBlockingOtherAccounts(t *testing.T) {
 	releaseManual := make(chan struct{})
 	manualDone := make(chan error, 1)
 	go func() {
-		manualDone <- manager.WithAccountLock(context.Background(), busy.ID, func() error {
+		manualDone <- withIMAPLockForTest(manager, context.Background(), busy.ID, func() error {
 			close(manualEntered)
 			<-releaseManual
 			return nil
@@ -1641,7 +1636,7 @@ func TestManualAndPeriodicSyncsShareGlobalConcurrencyWithoutBlockingOnAccountLoc
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
 
-	releaseConfiguration, err := manager.acquireAccount(context.Background(), busy.ID)
+	releaseConfiguration, err := manager.acquireIMAPAccountUntil(context.Background(), nil, busy.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1656,7 +1651,7 @@ func TestManualAndPeriodicSyncsShareGlobalConcurrencyWithoutBlockingOnAccountLoc
 	deadline := time.Now().Add(time.Second)
 	for {
 		manager.locksMu.Lock()
-		lock := manager.locks[busy.ID]
+		lock := manager.imapLocks[busy.ID]
 		waiterRegistered := lock != nil && lock.refs >= 2
 		manager.locksMu.Unlock()
 		if waiterRegistered {
@@ -1739,7 +1734,7 @@ func TestWithAccountIMAPSlotAcquiresAccountLockBeforeGlobalSlot(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		manager.locksMu.Lock()
-		secondHoldsAccountLock := manager.locks[2] != nil
+		secondHoldsAccountLock := manager.imapLocks[2] != nil
 		manager.locksMu.Unlock()
 		if secondHoldsAccountLock {
 			break
@@ -1776,6 +1771,15 @@ func TestWithAccountIMAPSlotRejectsNilOperation(t *testing.T) {
 	if err := manager.WithAccountIMAPSlot(context.Background(), 1, nil); err == nil {
 		t.Fatal("nil account IMAP operation succeeded")
 	}
+}
+
+func withIMAPLockForTest(manager *Manager, ctx context.Context, accountID int64, operation func() error) error {
+	release, err := manager.acquireIMAPAccountUntil(ctx, nil, accountID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return operation()
 }
 
 func TestCanceledAccountLockWaiterDoesNotPreventReclamation(t *testing.T) {
@@ -2176,7 +2180,7 @@ func TestRunDefersRetryWhenAccountLockRemainsBusy(t *testing.T) {
 		waitCalls++
 		if waitCalls == 1 {
 			var err error
-			releaseBusy, err = manager.acquireAccount(context.Background(), account.ID)
+			releaseBusy, err = manager.acquireIMAPAccountUntil(context.Background(), nil, account.ID)
 			if err != nil {
 				t.Fatalf("occupy account lock for retry: %v", err)
 			}
@@ -2520,7 +2524,7 @@ func TestRunPreservesPendingContinuationWhileAccountBusy(t *testing.T) {
 		defer releaseManualLock()
 		manualDone := make(chan error, 1)
 		go func() {
-			manualDone <- manager.WithAccountLock(ctx, account.ID, func() error {
+			manualDone <- withIMAPLockForTest(manager, ctx, account.ID, func() error {
 				close(manualEntered)
 				<-releaseManual
 				return nil
@@ -2529,7 +2533,7 @@ func TestRunPreservesPendingContinuationWhileAccountBusy(t *testing.T) {
 		deadline := time.Now().Add(time.Second)
 		for {
 			manager.locksMu.Lock()
-			lock := manager.locks[account.ID]
+			lock := manager.imapLocks[account.ID]
 			manualQueued := lock != nil && lock.refs >= 2
 			manager.locksMu.Unlock()
 			if manualQueued {
@@ -2599,7 +2603,7 @@ func TestRunPreservesPendingContinuationWhileAccountBusy(t *testing.T) {
 		})
 		manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
 		manager.SetSyncTimeout(40 * time.Millisecond)
-		releaseBusy, err := manager.acquireAccount(context.Background(), account.ID)
+		releaseBusy, err := manager.acquireIMAPAccountUntil(context.Background(), nil, account.ID)
 		if err != nil {
 			t.Fatal(err)
 		}

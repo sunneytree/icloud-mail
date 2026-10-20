@@ -27,6 +27,52 @@ func TestPoolLeaseCodeWaitSecondsValidation(t *testing.T) {
 	}
 }
 
+func TestPoolLeaseCodeWaitInitialSyncDeadlineChecksArchiveAndCancellationDoesNotReply(t *testing.T) {
+	for _, cancelRequest := range []bool{false, true} {
+		t.Run(map[bool]string{false: "deadline", true: "cancel"}[cancelRequest], func(t *testing.T) {
+			env := newAdminAPITestEnv(t)
+			f := newPoolDemandLease(t, env)
+			entered := make(chan struct{})
+			env.server.SetSharedMailboxReceiver(func(ctx context.Context, _ int64) error {
+				close(entered)
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			router, _ := env.server.Router()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/pool/leases/"+f.id+"/code?wait_seconds=1", nil).WithContext(ctx)
+			req.Header.Set("Authorization", "Bearer "+f.key)
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() { defer close(done); router.ServeHTTP(response, req) }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("initial sync did not start")
+			}
+			if cancelRequest {
+				cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("initial sync did not honor wait deadline")
+			}
+			if cancelRequest {
+				if response.Body.Len() != 0 {
+					t.Fatal("cancelled request published a response")
+				}
+			} else if response.Code != 200 || !strings.Contains(response.Body.String(), `"no_code"`) || strings.Contains(response.Body.String(), "SYNC_UNAVAILABLE") {
+				t.Fatalf("wait deadline returned sync failure: %d %s", response.Code, response.Body.String())
+			}
+			if env.server.accountPickupActive[f.accountID] != 0 {
+				t.Fatal("initial sync deadline leaked pickup admission")
+			}
+		})
+	}
+}
+
 func TestPoolLeaseCodeWaitRevalidatesWithoutGlobalLocks(t *testing.T) {
 	for _, mutation := range []string{"key", "lease", "account"} {
 		t.Run(mutation, func(t *testing.T) {
@@ -123,9 +169,13 @@ func TestPoolLeaseCodeWaitTimeoutAndCancellationReleaseAdmission(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("wait not subscribed")
 			}
+			read := serveV2Request(router, http.MethodGet, "/api/v1/pool/leases/"+f.id+"/code", "", map[string]string{"Authorization": "Bearer " + f.key})
+			if read.Code != http.StatusOK {
+				t.Fatalf("ordinary read during wait status=%d", read.Code)
+			}
 			duplicate := serveV2Request(router, http.MethodGet, req.URL.String(), "", map[string]string{"Authorization": "Bearer " + f.key})
-			if duplicate.Code != http.StatusTooManyRequests {
-				t.Fatalf("duplicate status=%d", duplicate.Code)
+			if duplicate.Code != http.StatusTooManyRequests || duplicate.Header().Get("X-RateLimit-Reason") != "mailbox_rate" {
+				t.Fatalf("refresh rate status=%d", duplicate.Code)
 			}
 			if cancelRequest {
 				cancel()

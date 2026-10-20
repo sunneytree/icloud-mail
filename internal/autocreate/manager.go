@@ -80,6 +80,19 @@ type Repository interface {
 // alias. It should not return a raw API key in an error or log message.
 type Creator func(context.Context, int64) (domain.Alias, error)
 
+// Availability reads local session state only; it must not probe Apple.
+type ChannelAvailability func(context.Context, int64) (domain.CreationChannelAvailability, error)
+
+func WithChannelAvailability(read ChannelAvailability) Option {
+	return func(m *Manager) error {
+		if read == nil {
+			return errors.New("channel availability reader is required")
+		}
+		m.channelAvailability = read
+		return nil
+	}
+}
+
 // RandomSource is deliberately small so tests can provide a deterministic
 // source. It is used for scheduling only, not for credentials or security.
 type RandomSource interface {
@@ -180,14 +193,15 @@ type Manager struct {
 	creator Creator
 	logger  *slog.Logger
 
-	clock        func() time.Time
-	random       RandomSource
-	wait         WaitFunc
-	pollInterval time.Duration
-	overdueGrace time.Duration
-	concurrency  int
-	randomMu     sync.Mutex
-	runSeq       atomic.Uint64
+	clock               func() time.Time
+	random              RandomSource
+	wait                WaitFunc
+	pollInterval        time.Duration
+	overdueGrace        time.Duration
+	concurrency         int
+	randomMu            sync.Mutex
+	runSeq              atomic.Uint64
+	channelAvailability ChannelAvailability
 }
 
 type aliasCreationScheduleDiagnosticError struct {
@@ -417,13 +431,29 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 		}
 	}
 
+	channels := domain.CreationChannelAvailability{AppleAccount: true, ICloudWeb: true}
+	if m.channelAvailability != nil {
+		var err error
+		channels, err = m.channelAvailability(ctx, schedule.AccountID)
+		if err != nil {
+			m.logAutomaticScheduleError(ctx, schedule.AccountID, "read_creation_channels", domain.AliasCreationPhasePreparing, expected, err)
+			return
+		}
+	}
+	slot := CreationsPerCycle - len(futurePlanIncludingCurrent(schedule.PlannedAt, expected))
 	claimAt := now
 	planned, err := m.planAfterClaim(schedule, expected, claimAt)
 	if err != nil {
 		m.logAutomaticScheduleError(ctx, schedule.AccountID, "build_next_schedule", domain.AliasCreationPhasePreparing, expected, err)
 		return
 	}
-	claimed, err := m.repo.ClaimAliasCreation(ctx, schedule.AccountID, expected, planned, claimAt)
+	skipped := !channels.ICloudWeb || !channels.AppleAccount && !domain.WebOnlyCreationSlot(slot)
+	var claimed bool
+	if skipped {
+		claimed, err = m.repo.RescheduleAliasCreation(ctx, schedule.AccountID, expected, planned, claimAt)
+	} else {
+		claimed, err = m.repo.ClaimAliasCreation(ctx, schedule.AccountID, expected, planned, claimAt)
+	}
 	if err != nil {
 		if ctx.Err() == nil {
 			m.logAutomaticScheduleError(ctx, schedule.AccountID, "claim_schedule_slot", domain.AliasCreationPhasePreparing, expected, err)
@@ -433,6 +463,11 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 		return
 	}
 	if !claimed {
+		return
+	}
+	// Creation needs the Web directory for identity validation and confirmation.
+	// Consume unused deadlines locally, keeping operator opt-in and slot order.
+	if skipped {
 		return
 	}
 	if gate, ok := m.repo.(interface {
@@ -543,8 +578,10 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 	creatorContext := domain.WithAliasCreationProgressReporter(ctx, func(update domain.AliasCreationProgressUpdate) {
 		m.logAliasCreationProgress(ctx, schedule.AccountID, &flow, update)
 	})
-	slot := CreationsPerCycle - len(futurePlanIncludingCurrent(schedule.PlannedAt, expected))
 	creatorContext = domain.WithScheduledCreationSlot(creatorContext, slot)
+	if !channels.AppleAccount {
+		creatorContext = domain.WithWebOnlyCreation(creatorContext)
+	}
 	alias, createErr := m.creator(creatorContext, schedule.AccountID)
 	address := strings.TrimSpace(alias.Address)
 	if createErr == nil && address == "" {
@@ -631,7 +668,7 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 		case errors.Is(createErr, ErrCapacityReached):
 			disableOperation = "disable_creation_schedule"
 			disableMessage = "达到容量上限后关闭自动创建失败"
-		case disableAliasCreationAfterError(createErr):
+		case disableAliasCreationAfterError(createErr) && !(m.channelAvailability != nil && creationSessionError(createErr)):
 			disableOperation = "disable_creation_schedule_after_account_error"
 			disableMessage = "账户或会话异常后关闭自动创建失败"
 		case aliasCreationUntrackedRemoteSideEffect(createErr):
@@ -703,6 +740,15 @@ func disableAliasCreationAfterError(err error) bool {
 		"APPLE_ACCOUNT_SESSION_EXPIRED", "APPLE_CREDENTIALS_INVALID",
 		"APPLE_VERIFICATION_INVALID", "APPLE_FLOW_EXPIRED", "APPLE_ACCOUNT_ACTION_REQUIRED", "APPLE_HME_AUTH_FAILED",
 		"APPLE_ACCOUNT_MISMATCH", "ACCOUNT_DISABLED", "ACCOUNT_CHANGED", "IMAP_AUTHENTICATION_PAUSED":
+		return true
+	default:
+		return false
+	}
+}
+
+func creationSessionError(err error) bool {
+	switch diagnoseAliasCreationError(err).code {
+	case "APPLE_LOGIN_REQUIRED", "APPLE_SESSION_EXPIRED", "APPLE_ACCOUNT_LOGIN_REQUIRED", "APPLE_ACCOUNT_SESSION_EXPIRED":
 		return true
 	default:
 		return false

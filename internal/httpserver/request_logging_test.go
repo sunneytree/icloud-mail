@@ -1,11 +1,55 @@
 package httpserver
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
+
+func TestPickupBusyLogsAreSampledWithoutHidingSyncFailures(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	var output bytes.Buffer
+	env.server.logger = slog.New(slog.NewJSONHandler(&output, nil))
+	router := gin.New()
+	router.Use(env.server.requestContext())
+	router.GET("/api/v1/otp", func(c *gin.Context) {
+		env.server.rejectMailboxPickup(c, "global_queue", "fixture busy", time.Second)
+	})
+	router.GET("/api/v1/mail/latest", func(c *gin.Context) {
+		env.server.writeAPIError(c, http.StatusServiceUnavailable, "SYNC_UNAVAILABLE", "fixture upstream failure")
+	})
+	for i := 0; i < 3; i++ {
+		serveV2Request(router, http.MethodGet, "/api/v1/otp", "", nil)
+		serveV2Request(router, http.MethodGet, "/api/v1/mail/latest", "", nil)
+	}
+	warnings, failures := 0, 0
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		switch entry["level"] {
+		case "WARN":
+			warnings++
+			if entry["limit_reason"] != "global_queue" || entry["retry_after_ms"] != "1000" {
+				t.Fatal("busy log lost its cause or retry hint")
+			}
+		case "ERROR":
+			failures++
+		}
+	}
+	if warnings != 1 || failures != 3 {
+		t.Fatalf("busy logs=%d upstream failure logs=%d, want 1/3", warnings, failures)
+	}
+}
 
 func TestRequestSamplerAllowAndSuppression(t *testing.T) {
 	s := newRequestSampler()

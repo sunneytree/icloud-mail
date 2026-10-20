@@ -1,5 +1,5 @@
 <template>
-  <div class="empty-state">
+  <div class="empty-state" role="status">
     <el-icon :size="28" aria-hidden="true"><MessageBox /></el-icon>
     <component :is="level" class="empty-state__title">{{ title }}</component>
     <p v-if="description">{{ description }}</p>

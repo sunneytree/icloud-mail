@@ -11,4 +11,8 @@ import "./styles/theme.css";
 import "./styles/index.css";
 
 initializeTheme();
-createApp(App).use(router).mount("#app");
+const app = createApp(App).use(router);
+// Keep the initial loading/recovery UI until authentication and route imports settle.
+router.isReady().then(() => app.mount("#app")).catch(() => {
+  window.dispatchEvent(new Event("icloud:startup-error"));
+});

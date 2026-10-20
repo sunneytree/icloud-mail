@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,14 @@ import (
 )
 
 func TestActiveReceiverHTTPFortyRootsPoolAndIdleArrival(t *testing.T) {
+	testActiveReceiverHTTPRoots(t, 40)
+}
+
+func TestActiveReceiverHTTPTwoHundredRootsPoolAndIdleArrival(t *testing.T) {
+	testActiveReceiverHTTPRoots(t, 200)
+}
+
+func testActiveReceiverHTTPRoots(t *testing.T, rootCount int) {
 	env := newAdminAPITestEnv(t)
 	ctx := context.Background()
 	if err := env.store.ConfigureMailArchive(t.TempDir(), 64<<20); err != nil {
@@ -59,8 +68,8 @@ func TestActiveReceiverHTTPFortyRootsPoolAndIdleArrival(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aliases := make([]domain.Alias, 40)
-	paths := make([]string, 40)
+	aliases := make([]domain.Alias, rootCount)
+	paths := make([]string, rootCount)
 	for i := range aliases {
 		aliases[i], _ = createV2AliasFixture(t, env, account.ID, fmt.Sprintf("root-%d@icloud.com", i))
 		dto, err := env.server.adminAPIAliasFromDomain(aliases[i])
@@ -125,12 +134,16 @@ func TestActiveReceiverHTTPFortyRootsPoolAndIdleArrival(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	started := time.Now()
+	durations := make(chan time.Duration, rootCount)
 	var wg sync.WaitGroup
 	for i, path := range paths {
 		wg.Add(1)
 		go func(i int, path string) {
 			defer wg.Done()
+			requestStarted := time.Now()
 			response := serveV2Request(router, http.MethodGet, path, "", nil)
+			durations <- time.Since(requestStarted)
 			want := fmt.Sprintf(`"otp":"%06d"`, 100000+i)
 			if response.Code != 200 || !strings.Contains(response.Body.String(), want) || strings.Contains(response.Body.String(), "888888") || strings.Contains(response.Body.String(), "777777") {
 				t.Errorf("root %d: %d %s", i, response.Code, response.Body.String())
@@ -138,9 +151,16 @@ func TestActiveReceiverHTTPFortyRootsPoolAndIdleArrival(t *testing.T) {
 		}(i, path)
 	}
 	wg.Wait()
+	elapsed := time.Since(started)
+	latencies := make([]time.Duration, rootCount)
+	for i := range latencies {
+		latencies[i] = <-durations
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	t.Logf("%d concurrent cold root pickups: total=%s p50=%s p95=%s", rootCount, elapsed, latencies[rootCount/2], latencies[(rootCount-1)*95/100])
 	trace.mu.Lock()
-	if len(trace.bodies) != 40 {
-		t.Errorf("body downloads=%d, want exactly 40", len(trace.bodies))
+	if len(trace.bodies) != rootCount {
+		t.Errorf("body downloads=%d, want exactly %d", len(trace.bodies), rootCount)
 	}
 	if trace.logins > 3 {
 		t.Errorf("initial logins=%d, want at most 3 including IDLE", trace.logins)
@@ -184,8 +204,8 @@ func TestActiveReceiverHTTPFortyRootsPoolAndIdleArrival(t *testing.T) {
 	}
 	t.Logf("warm fixture pickup: %s", time.Since(start))
 	trace.mu.Lock()
-	if len(trace.bodies) != 41 {
-		t.Fatalf("new mail body downloads=%d, want exactly 41", len(trace.bodies))
+	if len(trace.bodies) != rootCount+1 {
+		t.Fatalf("new mail body downloads=%d, want exactly %d", len(trace.bodies), rootCount+1)
 	}
 	trace.mu.Unlock()
 
@@ -218,41 +238,50 @@ func TestActiveReceiverHTTPFortyRootsPoolAndIdleArrival(t *testing.T) {
 		t.Fatal("waiting Pool reader missed IDLE arrival")
 	}
 	trace.mu.Lock()
-	if trace.logins != 2 || len(trace.bodies) != 42 {
-		t.Fatalf("shared connection trace: logins=%d bodies=%d, want 2/42", trace.logins, len(trace.bodies))
+	if trace.logins != 2 || len(trace.bodies) != rootCount+2 {
+		t.Fatalf("shared connection trace: logins=%d bodies=%d, want 2/%d", trace.logins, len(trace.bodies), rootCount+2)
 	}
 	trace.mu.Unlock()
 
-	ids := make([]int64, 0, 39)
+	ids := make([]int64, 0, rootCount-1)
 	for _, alias := range aliases[1:] {
 		ids = append(ids, alias.ID)
 	}
 	if err := env.store.EnrollPoolAliases(ctx, ids); err != nil {
 		t.Fatal(err)
 	}
-	more, err := env.store.ClaimPool(ctx, client.ID, store.PoolClaim{RequestID: "active-receiver-pool-0040", Count: 39, TTLSeconds: 600})
-	if err != nil || len(more) != 39 {
-		t.Fatalf("parallel leases: %v count=%d", err, len(more))
+	allLeases := append([]store.PoolLease{}, leases...)
+	for len(allLeases) < rootCount {
+		count := min(50, rootCount-len(allLeases))
+		more, err := env.store.ClaimPool(ctx, client.ID, store.PoolClaim{RequestID: fmt.Sprintf("active-receiver-more-%04d", len(allLeases)), Count: count, TTLSeconds: 600})
+		if err != nil || len(more) != count {
+			t.Fatalf("parallel leases: %v count=%d", err, len(more))
+		}
+		allLeases = append(allLeases, more...)
 	}
-	allLeases := append(leases, more...)
 	now = now.Add(3 * time.Second)
 	after = time.Now().Add(6 * time.Second)
-	results := make(chan *httptest.ResponseRecorder, 40)
+	results := make(chan *httptest.ResponseRecorder, rootCount)
 	for _, lease := range allLeases {
 		go func(lease store.PoolLease) {
-			results <- serveV2Request(router, http.MethodGet, "/api/v1/pool/leases/"+lease.ID+"/code?wait_seconds=5&after="+url.QueryEscape(after.Format(time.RFC3339Nano)), "", map[string]string{"Authorization": "Bearer " + key})
+			results <- serveV2Request(router, http.MethodGet, "/api/v1/pool/leases/"+lease.ID+"/code?wait_seconds=15&after="+url.QueryEscape(after.Format(time.RFC3339Nano)), "", map[string]string{"Authorization": "Bearer " + key})
 		}(lease)
 	}
-	deadline = time.Now().Add(3 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for {
 		env.server.aliasDemandRateMu.Lock()
 		active := env.server.accountPickupActive[account.ID]
 		env.server.aliasDemandRateMu.Unlock()
-		if active == 40 {
+		if active == rootCount {
 			break
 		}
+		select {
+		case r := <-results:
+			t.Fatalf("reader returned before staggered delivery: %d %s", r.Code, r.Body.String())
+		default:
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("concurrent waiting readers=%d, want 40", active)
+			t.Fatalf("concurrent waiting readers=%d, want %d", active, rootCount)
 		}
 		select {
 		case <-waitSubscribed:
@@ -269,22 +298,22 @@ func TestActiveReceiverHTTPFortyRootsPoolAndIdleArrival(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("first staggered arrival missed")
 	}
-	for i := 1; i < 40; i++ {
+	for i := 1; i < rootCount; i++ {
 		appendMail(fmt.Sprintf("root-%d+wave-b@icloud.com", i), fmt.Sprintf("%06d", 200000+i), after.Add(time.Second))
 	}
-	for i := 1; i < 40; i++ {
+	for i := 1; i < rootCount; i++ {
 		select {
 		case r := <-results:
 			if r.Code != 200 || !strings.Contains(r.Body.String(), `"success":true`) {
 				t.Fatalf("staggered wait: %d %s", r.Code, r.Body.String())
 			}
-		case <-time.After(6 * time.Second):
+		case <-time.After(16 * time.Second):
 			t.Fatal("parallel wait missed a committed arrival")
 		}
 	}
 	trace.mu.Lock()
 	defer trace.mu.Unlock()
-	if trace.logins != 2 || len(trace.bodies) != 82 {
-		t.Fatalf("forty waiters logins=%d bodies=%d, want 2/82", trace.logins, len(trace.bodies))
+	if trace.logins != 2 || len(trace.bodies) != 2*rootCount+2 {
+		t.Fatalf("%d waiters logins=%d bodies=%d, want 2/%d", rootCount, trace.logins, len(trace.bodies), 2*rootCount+2)
 	}
 }

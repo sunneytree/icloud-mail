@@ -77,11 +77,14 @@ paths:
         Pool Key 必须属于 lease 的项目。lease 为有效 leased 或 used，且主号和 alias 启用。
         查询起点取 after 与领取时间较晚者，只返回严格晚于起点的验证码。
         wait_seconds 默认 0，保留原单次按需读取；启用共享收件时正值允许等待新归档，
-        预算包含首轮同步。正常到期仍返回 no_code，首轮同步未完成或上游错误返回 503。
+        预算包含首轮同步。正值预算耗尽时最终读取本地归档，返回新码或正常 no_code；
+        请求取消则结束响应。单次同步未完成或确有上游错误返回 503 SYNC_UNAVAILABLE。
         未配置共享通知时退回单次读取。等待不持有全局轮换/Pool 锁，最终重新校验归属及状态。
-        共享模式同 root 容量 2，每 2 秒恢复 1 次额度；最多一个普通读取和一个长等待，
+        共享模式同 root 容量 2，每 2 秒恢复 1 次额度；额度内多个普通读取和长等待可共存，
         等待期间额度恢复，完成后不追加冷却。旧非共享路径保持独占和完成后 2 秒冷却。
-        超额返回 429；被拦截请求不延长恢复时间。
+        刷新频率超额返回 429；并发容量不足、队满或排队超时返回 503 PICKUP_BUSY。
+        共享模式全站 512 个执行槽、1024 个总受理名额，排队预算 2 秒；
+        长等待最多占 384 个执行槽、640 个受理名额。被拦截请求不延长恢复时间。
       security:
         - poolKey: []
       parameters:
@@ -133,20 +136,32 @@ paths:
         "409":
           description: LEASE_CLOSED，领取关闭、过期或主号/alias 停用。
         "429":
-          description: RATE_LIMITED，同类取件在途、速率预算不足或容量已满。在途/容量原因返回建议复查间隔。
+          description: RATE_LIMITED，刷新频率预算不足或旧非共享路径的完成后冷却。
           headers:
             Retry-After:
               description: 剩余等待时间向上取整的秒数。
               schema: {type: string, pattern: '^[1-9][0-9]*$'}
             X-Retry-After-Ms:
-              description: 剩余等待时间或建议复查间隔，单位毫秒。
+              description: 剩余等待时间，单位毫秒。
               schema: {type: string, pattern: '^[1-9][0-9]*$'}
             X-RateLimit-Reason:
               schema:
                 type: string
-                enum: [mailbox_rate, mailbox_waiting, mailbox_inflight, mailbox_cooldown, account_concurrency, global_concurrency, global_rate, mailbox_capacity]
+                enum: [mailbox_rate, mailbox_cooldown, global_rate]
         "503":
-          description: SYNC_UNAVAILABLE 或 POOL_UNAVAILABLE；同步异常时 Retry-After 为 3。
+          description: PICKUP_BUSY、SYNC_UNAVAILABLE 或 POOL_UNAVAILABLE；并发容量不足、队满或排队超时为 PICKUP_BUSY，同步异常时 Retry-After 为 3。
+          headers:
+            Retry-After:
+              description: 建议重试间隔，单位秒；取件容量繁忙时为 1。
+              schema: {type: string, pattern: '^[1-9][0-9]*$'}
+            X-Retry-After-Ms:
+              description: PICKUP_BUSY 的建议重试间隔，单位毫秒。
+              schema: {type: string, pattern: '^[1-9][0-9]*$'}
+            X-RateLimit-Reason:
+              description: 仅 PICKUP_BUSY 的并发或队列原因。
+              schema:
+                type: string
+                enum: [mailbox_waiting, mailbox_inflight, account_concurrency, global_concurrency, mailbox_capacity, wait_queue, global_queue, wait_concurrency]
   /api/v1/aliases:
     post:
       tags:
@@ -911,6 +926,90 @@ paths:
                 $ref: "#/components/schemas/AdminAppleErrorResponse"
         "503":
           description: 后台作业服务未启动、正在关闭或 Apple 删除服务不可用。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+
+  /api/v1/pool/aliases/batch/jobs/{operationID}/reconcile:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 安装级管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+      - url: https://HOST/admin
+        description: 固定兼容管理入口
+    post:
+      tags: [Mailbox Pool, Administration]
+      operationId: reconcilePoolAliasRetirementJob
+      summary: 核验原退休作业或显式授权恢复删除
+      description: |
+        要求管理员 Session、同源 CSRF 和原项目 Pool Key。items 必须与原作业完整、顺序完全一致，
+        包含原 alias_id、lease_id。作业缺失或属于其他项目返回 404；items 不匹配返回
+        409 IDEMPOTENCY_CONFLICT。同作业核验/恢复在途时，相同 resume 返回当前快照，
+        不同 resume 返回 409 RETIREMENT_ACTION_CONFLICT。
+
+        resume=false 只读取完整、权威的 Apple 目录：确认 absent 后仅对原 alias/lease 精确绑定
+        执行本地退休收口；确认 present 保持 review，结果码 APPLE_ALIAS_STILL_PRESENT，不删除。
+        resume=true 明确授权再次删除；fresh 完整权威目录确认 present 后沿原删除流程执行，
+        确认 absent 则执行原绑定的退休收口。目录读取失败或结果未知时保持 review，lease 保持
+        retiring，不开放租约操作，也不自动重放未知副作用。
+
+        每主号串行核验和删除；Apple RetryAfter 使用独立 cooldown，最短一分钟。
+        worker 结束后显式 POST 是新一轮动作，operationID 是原作业标识，并非该请求的
+        at-most-once 标识。原 POST 的幂等重放不恢复；响应未知时先 GET 恢复作业快照。
+      security:
+        - adminSession: []
+          poolKey: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+        - name: operationID
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 16
+            maxLength: 128
+            pattern: '^[A-Za-z0-9_-]{16,128}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PoolAliasRetirementReconcileRequest"
+      responses:
+        "202":
+          description: 核验或恢复已接收，或返回同一在途动作的快照；不表示全部删除已完成。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminAliasBatchDeleteCacheControl"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolAliasRetirementJobResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          description: 作业不存在或属于其他 Pool Key 项目。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "409":
+          description: items 不匹配时为 IDEMPOTENCY_CONFLICT；同一作业在途动作的 resume 不同则为 RETIREMENT_ACTION_CONFLICT。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "503":
+          description: 后台作业服务未启动、正在关闭或 Apple 服务不可用。
           content:
             application/json:
               schema:
@@ -2222,7 +2321,9 @@ components:
             - expired
           description: |
             login_required 表示尚无会话；verification_required 表示正在等待验证码；
-            authenticated 表示可同步目录；expired 表示需要重新登录。
+            authenticated 表示当前会话有效；expired 表示已知到期或认证失效。
+            Apple Account 的临时续期退避通过 health=retry_wait 单独说明，
+            不把临时故障等同于明确需要重新登录。
         apple_id:
           type: string
           description: 连接的 Apple ID；尚无会话时为空字符串。
@@ -2245,6 +2346,26 @@ components:
             - "null"
           format: date-time
           description: 已知的会话或验证码挑战到期时间；上游未提供时为 null。
+        health:
+          type: string
+          enum: [healthy, retry_wait, login_required]
+          description: Apple Account 的本地续期健康状态；旧通道可省略。
+        last_refreshed_at:
+          type: string
+          format: date-time
+          description: 最近一次成功续期；没有成功记录时省略。
+        next_refresh_at:
+          type: string
+          format: date-time
+          description: 已保存的下次续期计划，包含退避；明确认证失效时省略。
+        next_retry_at:
+          type: string
+          format: date-time
+          description: 临时失败后的持久化重试时间；无重试计划时省略。
+        refresh_failures:
+          type: integer
+          minimum: 0
+          description: 连续续期失败次数；为零时可省略。
 
     AdminAliasAutoCreation:
       type: object
@@ -2657,6 +2778,21 @@ components:
           maxItems: 100
           items:
             $ref: "#/components/schemas/PoolAliasRetirementItemRequest"
+    PoolAliasRetirementReconcileRequest:
+      type: object
+      additionalProperties: false
+      required: [items, resume]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: 原作业完整 items；alias_id、lease_id 和顺序必须完全一致。
+          items:
+            $ref: "#/components/schemas/PoolAliasRetirementItemRequest"
+        resume:
+          type: boolean
+          description: false 仅核验权威目录；true 明确授权 fresh 确认地址 present 后恢复原删除流程。
     PoolAliasRetirementItemRequest:
       type: object
       additionalProperties: false

@@ -161,6 +161,21 @@ func (s *Store) GetPoolAliasRetirementJob(ctx context.Context, operationID, clie
 	return job, nil
 }
 
+// PoolAliasRetirementOperationOwnedByAnother is intentionally boolean-only.
+// HTTP uses it to preserve a stable idempotency conflict without exposing a
+// different project's job, items, or state before request preflight runs.
+func (s *Store) PoolAliasRetirementOperationOwnedByAnother(ctx context.Context, operationID, clientID string) (bool, error) {
+	var owner string
+	err := s.queryRowContext(ctx, `SELECT client_id FROM pool_alias_retirement_jobs WHERE operation_id=?`, operationID).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return owner != clientID, nil
+}
+
 // PoolAliasRetirementAccounts is a read-only first pass used to validate that
 // every target account still has a usable Apple session before changing leases.
 // StartPoolAliasRetirement repeats all storage checks atomically.

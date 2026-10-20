@@ -17,7 +17,7 @@ function fixture(overrides = {}) {
     deleteAppleAccountAuth: async (...args) => { calls.push(["delete", ...args]); },
     ...overrides,
   };
-  const factory = Function("computed", "onBeforeUnmount", "ref", "watch", "defineProps", "defineEmits", "ElMessage", ...Object.keys(api), `${script}\nreturn { visible, loading, error, session, step, appleId, password, code, challengeId, openManager, closeManager, openLogin, login, verify, logoutAccount, manageWeb };`);
+  const factory = Function("computed", "onBeforeUnmount", "ref", "watch", "defineProps", "defineEmits", "ElMessage", ...Object.keys(api), `${script}\nreturn { visible, loading, error, session, statusLabel, step, appleId, password, code, challengeId, openManager, closeManager, openLogin, login, verify, logoutAccount, manageWeb };`);
   const component = factory(computed, fn => { dispose = fn; }, ref, watch, () => props, () => (...args) => events.push(args), { success() {} }, ...Object.values(api));
   return { component, props, calls, events, dispose: () => dispose() };
 }
@@ -88,5 +88,16 @@ test("late session read cannot overwrite a fresh login checkpoint", async () => 
   c.closeManager(() => {});
   assert.equal(c.password.value, ""); assert.equal(c.code.value, "");
   assert.doesNotMatch(script, /setInterval|setTimeout/);
+  dispose();
+});
+
+test("temporary renewal failure remains distinct from a rejected login", async () => {
+  const { component: c, dispose } = fixture({ getAppleAccountAuth: async () => ({ appleSession: {
+    status: "expired", health: "retry_wait", nextRetryAt: "2026-10-16T08:00:00Z",
+  } }) });
+  await nextTick(); await nextTick();
+  assert.equal(c.statusLabel.value, "等待续期重试");
+  c.session.value = { status: "expired", health: "login_required" };
+  assert.equal(c.statusLabel.value, "需重新登录");
   dispose();
 });

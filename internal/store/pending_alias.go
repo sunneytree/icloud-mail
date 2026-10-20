@@ -122,6 +122,7 @@ func scanPendingAliasAPIKey(scanner rowScanner) (domain.PendingAliasAPIKey, erro
 		&alias.CredentialVersion, &mailboxUIDValidity, &mailboxUIDNext,
 		&enabled, &alias.LastSyncStatus, &alias.LastSyncError,
 		&lastSyncedAt, &lastAccessedAt, &createdAt, &updatedAt, &latestReceivedAt, &alias.AccountDisabled,
+		&alias.ReceiveRevision,
 		&pending.APIKeyCiphertext, &pendingCreatedAt,
 	); err != nil {
 		if err == sql.ErrNoRows {

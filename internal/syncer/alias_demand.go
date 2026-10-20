@@ -175,13 +175,18 @@ func (m *Manager) syncAliasDemand(ctx context.Context, aliasID int64) (retErr er
 		if err != nil {
 			if useWebMail || domain.IsIMAPAuthenticationFailure(err.Error()) {
 				failures := newFailureRecorder(m, ctx, account.ID, account.UpdatedAt)
+				failures.account = &account
 				defer failures.close()
 				failures.record(err)
 			}
 			return err
 		}
 		failedOperation = "publish"
-		if useWebMail {
+		if observed, ok := m.repo.(interface {
+			ApplyObservedAliasMailboxSync(context.Context, domain.Account, domain.Alias, domain.MailboxSyncResult, time.Time, bool) error
+		}); ok {
+			err = observed.ApplyObservedAliasMailboxSync(ctx, account, current, result, time.Now().UTC(), useWebMail)
+		} else if useWebMail {
 			webRepo, ok := m.repo.(webMailRepository)
 			if !ok {
 				return errors.New("web mail persistence unavailable")

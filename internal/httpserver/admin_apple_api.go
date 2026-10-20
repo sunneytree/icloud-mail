@@ -62,6 +62,11 @@ type adminAPIAppleSessionDTO struct {
 	Region          string  `json:"region"`
 	AuthenticatedAt *string `json:"authenticated_at"`
 	ExpiresAt       *string `json:"expires_at"`
+	Health          string  `json:"health,omitempty"`
+	LastRefreshedAt *string `json:"last_refreshed_at,omitempty"`
+	NextRefreshAt   *string `json:"next_refresh_at,omitempty"`
+	NextRetryAt     *string `json:"next_retry_at,omitempty"`
+	RefreshFailures int     `json:"refresh_failures,omitempty"`
 }
 
 type adminAPIAppleAuthResultDTO struct {
@@ -357,6 +362,11 @@ func adminAPIAppleSessionFromInfo(info hmesync.SessionInfo) *adminAPIAppleSessio
 		Region:          info.Region,
 		AuthenticatedAt: adminAPIOptionalTime(info.AuthenticatedAt),
 		ExpiresAt:       adminAPIOptionalTime(info.ExpiresAt),
+		Health:          info.Health,
+		LastRefreshedAt: adminAPIOptionalTime(info.LastRefreshedAt),
+		NextRefreshAt:   adminAPIOptionalTime(info.NextRefreshAt),
+		NextRetryAt:     adminAPIOptionalTime(info.NextRetryAt),
+		RefreshFailures: info.RefreshFailures,
 	}
 }
 
@@ -597,6 +607,10 @@ func (s *Server) adminAPIFinishAppleFailure(
 	action string,
 	apiErr adminAPIAppleError,
 ) {
+	var diagnostics any
+	if apiErr.WebSessionDiagnostics != nil {
+		diagnostics = *apiErr.WebSessionDiagnostics
+	}
 	s.logger.Warn("Apple 管理操作失败",
 		"account_id", accountID,
 		"action", action,
@@ -604,7 +618,7 @@ func (s *Server) adminAPIFinishAppleFailure(
 		"upstream_operation", apiErr.UpstreamOperation,
 		"upstream_status", apiErr.UpstreamStatus,
 		"upstream_service_code", apiErr.UpstreamServiceCode,
-		"hme_request_diagnostics", apiErr.WebSessionDiagnostics,
+		"hme_request_diagnostics", diagnostics,
 		"request_id", requestID(c),
 	)
 	s.audit(c, &adminSession.AdminID, adminSession.Username, action, "account", strconv.FormatInt(accountID, 10), "failed", apiErr.Code)

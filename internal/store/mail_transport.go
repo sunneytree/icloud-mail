@@ -46,7 +46,8 @@ func (s *Store) SetAccountMailTransport(ctx context.Context, accountID int64, tr
 		return fmt.Errorf("begin mail transport update: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := s.lockAccountVersionForUpdate(ctx, tx, accountID); err != nil {
+	version, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
+	if err != nil {
 		return err
 	}
 	state, err := s.readAccountMailboxStateTx(ctx, tx, accountID)
@@ -67,9 +68,13 @@ func (s *Store) SetAccountMailTransport(ctx context.Context, accountID int64, tr
 			return ErrICloudMailboxRequired
 		}
 	}
+	next, err := s.bumpAccountVersionTx(ctx, tx, accountID, version)
+	if err != nil {
+		return err
+	}
 	if _, err := s.txExecContext(ctx, tx, `
 INSERT INTO account_mail_transports(account_id, transport, updated_at) VALUES(?, ?, ?)
-ON CONFLICT(account_id) DO UPDATE SET transport = excluded.transport, updated_at = excluded.updated_at`, accountID, transport, timestamp(s.now())); err != nil {
+ON CONFLICT(account_id) DO UPDATE SET transport = excluded.transport, updated_at = excluded.updated_at`, accountID, transport, next); err != nil {
 		return err
 	}
 	return tx.Commit()

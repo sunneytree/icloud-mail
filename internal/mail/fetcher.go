@@ -16,7 +16,7 @@ const (
 	defaultIMAPTimeout   = 8 * time.Second
 	defaultMaxAliases    = domain.MaxEnabledAliasesPerAccount
 	defaultMaxCandidates = 1024
-	// Message bodies are read sequentially and each batch commits atomically.
+	// Message bodies use a combined FETCH and each batch commits atomically.
 	// Small default batches can save progress before exhausting the sync budget.
 	defaultMaxIncrementalCandidates = 32
 	maxIncrementalCandidates        = 256
@@ -42,13 +42,15 @@ type Fetcher struct {
 	IMAPTimeout time.Duration
 	MaxAliases  int
 	// MaxCandidates bounds the recent UID window established on a reset.
-	MaxCandidates             int
-	MaxIncrementalCandidates  int
-	MaxHeaderBytes            int
-	MaxMessageBytes           int
-	MaxBodyBytes              int
-	MaxParsedMessageBytes     int
-	ActiveRecentWindow        time.Duration
+	MaxCandidates            int
+	MaxIncrementalCandidates int
+	MaxHeaderBytes           int
+	MaxMessageBytes          int
+	MaxBodyBytes             int
+	MaxParsedMessageBytes    int
+	ActiveRecentWindow       time.Duration
+	// Deprecated: active recovery uses ActiveRecentWindow and UID pagination,
+	// rather than truncating the whole window to a fixed message count.
 	ActiveRecentCandidates    int
 	AllowWeakRecipientHeaders bool
 	// ArchiveTempDir receives complete MIME literals before the store publishes
@@ -140,7 +142,6 @@ type fetchSettings struct {
 	archiveTempDir            string
 	activeRecent              bool
 	activeRecentWindow        time.Duration
-	activeRecentCandidates    int
 }
 
 func (f *Fetcher) settings() fetchSettings {
@@ -154,7 +155,6 @@ func (f *Fetcher) settings() fetchSettings {
 		maxBodyBytes:             defaultMaxBodyBytes,
 		now:                      time.Now,
 		activeRecentWindow:       15 * time.Minute,
-		activeRecentCandidates:   128,
 	}
 	if f == nil {
 		settings.maxParsedMessageBytes = settings.maxBodyBytes + defaultMetadataResultBytes
@@ -192,9 +192,6 @@ func (f *Fetcher) settings() fetchSettings {
 	settings.archiveTempDir = strings.TrimSpace(f.ArchiveTempDir)
 	if f.ActiveRecentWindow > 0 {
 		settings.activeRecentWindow = f.ActiveRecentWindow
-	}
-	if f.ActiveRecentCandidates > 0 {
-		settings.activeRecentCandidates = min(f.ActiveRecentCandidates, defaultMaxCandidates)
 	}
 	if f.now != nil {
 		settings.now = f.now

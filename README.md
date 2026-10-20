@@ -2,7 +2,7 @@
 
 自托管的 **iCloud 隐藏邮箱管理、邮箱池与 API 取码服务**，带本地化 Web 控制面板。
 
-**当前版本：v0.2.2** · [下载与发布说明](https://github.com/t508708/icloud-mail/releases/tag/v0.2.2) · [更新日志](CHANGELOG.md) · [安装文档](DELIVERY.md)
+**当前版本：v0.2.6** · [下载与发布说明](https://github.com/t508708/icloud-mail/releases/tag/v0.2.6) · [更新日志](CHANGELOG.md) · [安装文档](DELIVERY.md)
 
 ## 核心功能
 
@@ -15,10 +15,11 @@
 | 邮件接收 | 按需增量收件、同主号连接复用、MIME 归档、只读 IMAPS |
 | 独立凭据 | 每邮箱 API Key、IMAP 密码及 OAuth 凭据，由本网关签发 |
 
-## v0.2.2 更新重点
+## v0.2.6 更新重点
 
-- **直接部署**：应用与 PostgreSQL 镜像发布到 GHCR，默认使用自动更新的 `latest`，同时支持 amd64 和 arm64。
-- **项目入口**：仓库已迁移为独立项目并保留上游来源与许可说明；后台和 README 增加 QQ 群入口。
+- **并发取件优化**：不同隐藏邮箱复用主号同步，普通取件预留容量；并发繁忙返回可重试的 503，429 仅用于刷新频率超额。
+- **新邮件窗口续传**：冷启动按最近时间窗口分批读取，跨批次与重启继续，不再截断为最后 128 封，也不下载整个历史邮箱正文。
+- **保活与目录补充**：到期主号独立保活；Web 认证失效时可使用 Account 连接读取目录，后台显示续期及重试状态。
 
 从初版 `v0.1.0` 起的完整新增、调整、修复与验证记录见 [更新日志](CHANGELOG.md)。
 
@@ -81,6 +82,10 @@ docker compose -f compose.yaml -f compose.build.yaml up -d --build --wait
 [安装与升级](DELIVERY.md) · [公网部署](docs/PUBLIC.md) · [邮箱池与 API](docs/POOL.md) · [OpenAPI](docs/openapi.yaml)
 
 [配置与兼容说明](docs/REFERENCE.md) · [收件设计](docs/MAIL-RECEPTION.md) · [测试与实测记录](docs/RECEIVER-VALIDATION.md)
+
+[自动创建与通道恢复](docs/AUTO_CREATION_CHANNELS.md)
+
+每个部署的 `/docs/` 提供随服务版本更新的公开接入说明；对应源码见 [内置接口文档](internal/httpserver/docs.html)。
 
 ## 来源与许可
 
