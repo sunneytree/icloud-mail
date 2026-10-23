@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -190,16 +189,6 @@ func (s *Server) adminAPIPreflightAliasBatchDelete(
 			})
 			return nil, false
 		}
-		if strings.EqualFold(strings.TrimSpace(account.LastSyncStatus), domain.SyncStatusError) ||
-			strings.TrimSpace(account.LastSyncError) != "" {
-			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIAppleError{
-				Status:  http.StatusConflict,
-				Code:    "BATCH_DELETE_NOT_ELIGIBLE",
-				Message: "该 iCloud 主号存在同步错误，请先处理错误后再批量删除",
-			})
-			return nil, false
-		}
-
 		info, err := s.hmeSync.GetSession(c.Request.Context(), accountID)
 		if err != nil {
 			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, classifyAdminAPIAppleError(err))

@@ -328,6 +328,22 @@ test("result messages deduplicate retention notices and distinguish deferred and
   assert.equal(formatAliasDeletionResultMessage({ deleted: true, message: "本地记录已保留" }), "已删除");
 });
 
+test("cancellation requests the active job once and keeps its terminal snapshot", async () => {
+  const { controller, calls } = harness({
+    cancelJob: async (id, csrf) => {
+      calls.push(["CANCEL", id, csrf]);
+      return job("interrupted", { processed: 1, failed: 1, results: [{ id: 91, deleted: false, code: "BATCH_DELETE_INTERRUPTED" }] });
+    },
+  });
+  await controller.start();
+  await controller.submit([91], "csrf");
+  assert.equal(await controller.cancel("csrf"), true);
+  assert.deepEqual(calls.at(-1).slice(0, 3), ["CANCEL", operationId, "csrf"]);
+  assert.equal(controller.getState().job.status, "interrupted");
+  assert.equal(controller.getState().blocked, false);
+  controller.stop();
+});
+
 test("lost submit responses query operationId even when latest has an unrelated completed job", async () => {
   const calls = [];
   const { controller, storage } = harness({

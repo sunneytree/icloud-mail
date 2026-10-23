@@ -84,6 +84,14 @@
             <el-button type="primary" @click="openEnroll"
               >加入已有邮箱</el-button
             >
+            <el-button
+              type="danger"
+              plain
+              :loading="poolDeleteLoading"
+              :disabled="busy || poolDeleteConfirming || poolDeletionState.recovering || poolDeletionState.uncertain || poolDeletionState.cancelling"
+              @click="openPoolDeleteAction"
+              >{{ poolDeletionActive ? "查看删除进度" : "批量删除当前筛选" }}</el-button
+            >
           </div>
           <div class="pool-table-scroll" role="region" aria-label="邮箱库存列表" tabindex="0"><el-table
             :data="members.items"
@@ -440,6 +448,93 @@ grant_type=refresh_token&amp;client_id=CLIENT_ID&amp;refresh_token=REFRESH_TOKEN
       </el-tabs>
 
       <el-dialog
+        v-model="poolDeleteConfirmOpen"
+        title="确认批量删除邮箱池结果"
+        width="min(760px,94vw)"
+        destroy-on-close
+        :close-on-click-modal="false"
+        :close-on-press-escape="!poolDeleteConfirming"
+        :show-close="!poolDeleteConfirming"
+      >
+        <p class="pool-delete-warning">
+          将按当前筛选结果从 Apple 永久删除这些隐私邮箱。同一主号内串行，不同主号最多两个执行名额，并按 Apple 限流策略等待；已发出的邮箱不会因取消而恢复。
+        </p>
+        <div class="pool-delete-filters">
+          <strong>筛选条件</strong>
+          <span v-for="filter in poolDeletePreview.filters" :key="filter.label">{{ filter.label }}：{{ filter.value }}</span>
+        </div>
+        <p class="pool-delete-count">匹配 {{ poolDeletePreview.total }} 个邮箱</p>
+        <div class="pool-delete-preview" role="region" aria-label="待删除邮箱预览">
+          <div v-for="row in poolDeletePreview.items" :key="row.alias_id" class="pool-delete-preview__row">
+            <span>{{ row.address }}</span>
+            <small>{{ row.account_email }}</small>
+          </div>
+          <p v-if="poolDeletePreview.total > poolDeletePreview.items.length" class="pool-hint">
+            仅展示前 {{ poolDeletePreview.items.length }} 个，确认后将处理全部 {{ poolDeletePreview.total }} 个。
+          </p>
+        </div>
+        <template #footer>
+          <el-button :disabled="poolDeleteConfirming" @click="poolDeleteConfirmOpen = false">取消</el-button>
+          <el-button
+            type="danger"
+            :loading="poolDeleteConfirming"
+            :disabled="!poolDeletePreview.ids.length"
+            @click="submitPoolDelete"
+          >确认删除 {{ poolDeletePreview.total }} 个</el-button>
+        </template>
+      </el-dialog>
+
+      <el-dialog
+        v-model="poolDeleteProgressOpen"
+        title="邮箱池批量删除进度"
+        width="min(760px,94vw)"
+        :close-on-click-modal="false"
+      >
+        <template v-if="poolDeletionJob">
+          <div class="pool-delete-progress__header">
+            <el-tag :type="poolDeletionJobType">{{ poolDeletionStatusLabel }}</el-tag>
+            <span v-if="poolDeletionJob.requestId">请求编号：{{ poolDeletionJob.requestId }}</span>
+          </div>
+          <p role="status" aria-live="polite">
+            已处理 {{ poolDeletionJob.processed }} / {{ poolDeletionJob.requested }}；成功删除 {{ poolDeletionJob.deleted }}；失败/未执行 {{ poolDeletionJob.failed }}
+            <span v-if="poolDeletionJob.deferred">（未执行 {{ poolDeletionJob.deferred }}）</span>
+          </p>
+          <el-progress :percentage="poolDeletionPercentage" :show-text="false" aria-label="邮箱池批量删除进度" />
+          <p class="pool-hint">任务 {{ poolDeletionJob.jobId }} · 更新于 {{ date(poolDeletionJob.updatedAt) }}</p>
+          <div v-if="poolDeletionWaits.length" class="pool-delete-waits" role="status" aria-live="polite">
+            <strong>Apple 限流等待</strong>
+            <span v-for="(wait, index) in poolDeletionWaits" :key="`${wait.accountId}:${wait.aliasId}:${index}`">
+              主号 {{ wait.accountId }} · {{ ALIAS_DELETION_OPERATION_LABELS[wait.operation] }} · 下次 {{ formatTime(wait.retryAt, { seconds: true }) }}
+            </span>
+          </div>
+          <div v-if="poolDeletionRecentFailures.length" class="pool-delete-failures">
+            <strong>最近失败或待核对结果</strong>
+            <span v-for="item in poolDeletionRecentFailures" :key="item.id">{{ item.address || `ID ${item.id}` }}：{{ formatAliasDeletionResultMessage(item) }}</span>
+          </div>
+        </template>
+        <p v-else-if="poolDeletionState.recovering">正在恢复最近删除任务，请稍候。</p>
+        <p v-else>当前没有可显示的删除任务。</p>
+        <p v-if="isAliasDeletionJobActive(poolDeletionJob)" class="pool-hint">
+          关闭此窗口不会停止后台任务；可以再次点击“查看删除进度”打开。
+        </p>
+        <template #footer>
+          <el-button
+            :loading="poolDeletionState.checking"
+            :disabled="poolDeletionState.cancelling || poolDeletionState.submitting"
+            @click="poolDeletionController.refresh()"
+          >刷新进度</el-button>
+          <el-button
+            v-if="isAliasDeletionJobActive(poolDeletionJob)"
+            type="warning"
+            :loading="poolDeletionState.cancelling"
+            :disabled="poolDeletionState.checking || poolDeletionState.submitting"
+            @click="cancelPoolDelete"
+          >取消任务</el-button>
+          <el-button @click="poolDeleteProgressOpen = false">关闭</el-button>
+        </template>
+      </el-dialog>
+
+      <el-dialog
         v-model="enrollOpen"
         title="加入已有邮箱"
         width="min(760px,94vw)"
@@ -544,13 +639,31 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus";
 import zhCn from "element-plus/es/locale/lang/zh-cn";
 import { apiRequest } from "../api/client.js";
-import { getAliasPage, getAllAliases, getAllAccounts } from "../api/admin.js";
+import {
+  cancelAliasDeletionJob,
+  getAliasDeletionJob,
+  getAliasPage,
+  getAllAliases,
+  getAllAccounts,
+  getLatestAliasDeletionJob,
+  startAliasDeletionJob,
+} from "../api/admin.js";
 import { mergePoolPageSelection, poolAliasSelectable, submitPoolEnrollment } from "../utils/poolEnrollment.js";
 import { useAuth } from "../stores/auth.js";
 import SectionHeader from "../components/SectionHeader.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import { copyText } from "../utils/clipboard.js";
 import { createCheckboxDragSelection } from "../utils/checkboxDragSelection.js";
+import {
+  ALIAS_DELETION_OPERATION_LABELS,
+  createAliasDeletionController,
+  createAliasDeletionStorage,
+  formatAliasDeletionResultMessage,
+  isAliasDeletionJobActive,
+  isAliasDeletionJobTerminal,
+} from "../utils/aliasDeletionJob.js";
+import { ADMIN_BASE_PATH } from "../utils/runtimePath.js";
+import { formatTime } from "../utils/format.js";
 
 const auth = useAuth();
 const tab = ref("members"),
@@ -576,6 +689,11 @@ const memberState = ref(""),
   projectName = ref("");
 const memberPage = ref(1),
   leasePage = ref(1);
+const poolDeleteLoading = ref(false),
+  poolDeleteConfirmOpen = ref(false),
+  poolDeleteConfirming = ref(false),
+  poolDeleteProgressOpen = ref(false),
+  poolDeletePreview = ref({ filters: [], total: 0, ids: [], items: [] });
 const enrollOpen = ref(false),
   enrollDraft = ref(""),
   enrollSearch = ref(""),
@@ -658,6 +776,69 @@ const query = (params) =>
   ).toString();
 const request = (path, method = "GET", body, signal) =>
   apiRequest(path, { method, body, signal, csrfToken: auth.state.csrfToken });
+const poolDeletionState = ref({
+  job: null,
+  operationId: "",
+  recovering: true,
+  submitting: false,
+  cancelling: false,
+  checking: false,
+  uncertain: false,
+  error: null,
+  blocked: true,
+});
+let poolDeletionController;
+function makePoolDeletionController() {
+  const username = auth.state.username;
+  return createAliasDeletionController({
+    startJob: startAliasDeletionJob,
+    getJob: getAliasDeletionJob,
+    getLatestJob: getLatestAliasDeletionJob,
+    cancelJob: cancelAliasDeletionJob,
+    storage: createAliasDeletionStorage(ADMIN_BASE_PATH, username),
+    onChange(next) {
+      if (auth.state.username !== username) return;
+      poolDeletionState.value = next;
+      if (isAliasDeletionJobTerminal(next.job)) {
+        void loadMembers();
+      }
+    },
+  });
+}
+poolDeletionController = makePoolDeletionController();
+const poolDeletionJob = computed(() => poolDeletionState.value.job);
+const poolDeletionActive = computed(() =>
+  poolDeletionState.value.submitting || isAliasDeletionJobActive(poolDeletionJob.value),
+);
+const poolDeletionPercentage = computed(() => {
+  const job = poolDeletionJob.value;
+  return job?.requested ? Math.min(100, Math.max(0, job.processed / job.requested * 100)) : 0;
+});
+const poolDeletionRecentFailures = computed(() =>
+  (poolDeletionJob.value?.results || []).filter((item) => !item.deleted).slice(-5).reverse(),
+);
+const poolDeletionWaits = computed(() =>
+  poolDeletionJob.value?.status === "running" ? poolDeletionJob.value.waits || [] : [],
+);
+const poolDeletionJobType = computed(() => {
+  if (poolDeletionState.value.uncertain || poolDeletionWaits.value.length || poolDeletionJob.value?.failed || poolDeletionJob.value?.status === "interrupted") return "warning";
+  return poolDeletionJob.value?.status === "completed" ? "success" : "info";
+});
+const poolDeletionStatusLabel = computed(() => {
+  if (poolDeletionState.value.submitting) return "正在提交";
+  if (poolDeletionState.value.cancelling) return "正在取消";
+  if (poolDeletionState.value.uncertain) return "结果待确认";
+  if (poolDeletionState.value.recovering) return "恢复任务中";
+  if (poolDeletionWaits.value.length) return "执行中（Apple 限流等待）";
+  return { queued: "排队中", running: "执行中", completed: "已完成", interrupted: "已中断" }[poolDeletionJob.value?.status] || "查询中";
+});
+watch(() => auth.state.username, (username, previous) => {
+  if (!username || username === previous) return;
+  poolDeletionController.stop();
+  poolDeletionController = makePoolDeletionController();
+  poolDeletionState.value = poolDeletionController.getState();
+  void poolDeletionController.start();
+}, { flush: "sync" });
 let poolRefreshTicket = 0;
 let poolRefreshController;
 let memberReadTicket = 0;
@@ -686,6 +867,84 @@ async function loadMembers(signal) {
     );
     if (ticket === memberReadTicket) members.value = result;
   });
+}
+function poolDeleteFilterSummary() {
+  const account = mainAccounts.value.find((item) => String(item.id) === String(memberAccountId.value));
+  return [
+    { label: "用途", value: purposeName(memberPurpose.value) },
+    { label: "主号", value: account?.email || "全部主号" },
+    { label: "状态", value: memberState.value ? stateName(memberState.value) : "全部状态" },
+    { label: "搜索", value: search.value.trim() || "全部邮箱" },
+  ];
+}
+async function getAllFilteredPoolMembers() {
+  const items = [];
+  const snapshot = {
+    state: memberState.value,
+    purpose: memberPurpose.value,
+    account_id: memberAccountId.value,
+    q: search.value.trim(),
+  };
+  let offset = 0;
+  let total = 0;
+  do {
+    const result = await request("/pool/members?" + query({ ...snapshot, limit: 200, offset }));
+    const pageItems = Array.isArray(result?.items) ? result.items : [];
+    items.push(...pageItems);
+    total = Number(result?.total) || items.length;
+    offset += pageItems.length;
+    if (!pageItems.length) break;
+  } while (items.length < total);
+  return { items, total: items.length };
+}
+async function openPoolDeleteAction() {
+  if (poolDeletionActive.value) {
+    poolDeleteProgressOpen.value = true;
+    return;
+  }
+  if (poolDeleteLoading.value || poolDeleteConfirming.value || poolDeletionState.value.recovering || poolDeletionState.value.uncertain || poolDeletionState.value.cancelling) return;
+  poolDeleteLoading.value = true;
+  error.value = null;
+  try {
+    const result = await getAllFilteredPoolMembers();
+    if (!result.items.length) {
+      ElMessage.info("当前筛选没有匹配的邮箱");
+      return;
+    }
+    if (result.items.length > 1000) {
+      throw Object.assign(new Error("当前筛选超过单次 Apple 批量删除上限 1000 个，请缩小筛选范围后再操作。"), { code: "BATCH_DELETE_TOO_LARGE" });
+    }
+    poolDeletePreview.value = {
+      filters: poolDeleteFilterSummary(),
+      total: result.items.length,
+      ids: result.items.map((row) => row.alias_id),
+      items: result.items.slice(0, 50),
+    };
+    poolDeleteConfirmOpen.value = true;
+  } catch (e) {
+    if (e.name !== "AbortError") error.value = e;
+  } finally {
+    poolDeleteLoading.value = false;
+  }
+}
+async function submitPoolDelete() {
+  if (poolDeleteConfirming.value || !poolDeletePreview.value.ids.length) return;
+  poolDeleteConfirming.value = true;
+  poolDeleteConfirmOpen.value = false;
+  poolDeleteProgressOpen.value = true;
+  error.value = null;
+  try {
+    await poolDeletionController.submit(poolDeletePreview.value.ids, auth.state.csrfToken);
+  } catch (e) {
+    error.value = e;
+    poolDeleteProgressOpen.value = false;
+  } finally {
+    poolDeleteConfirming.value = false;
+  }
+}
+async function cancelPoolDelete() {
+  if (!isAliasDeletionJobActive(poolDeletionJob.value)) return;
+  await poolDeletionController.cancel(auth.state.csrfToken);
 }
 async function loadLeases(signal) {
   const ticket = ++leaseReadTicket;
@@ -761,6 +1020,7 @@ onBeforeUnmount(() => {
   ++memberReadTicket;
   ++leaseReadTicket;
   poolRefreshController?.abort();
+  poolDeletionController.stop();
 });
 async function mutate(fn) {
   if (busy.value) return;
@@ -1034,7 +1294,10 @@ const codeExample = computed(
   () =>
     `curl '${location.origin}/api/v1/pool/leases/LEASE_ID/code' \\\n  -H 'Authorization: Bearer PROJECT_KEY'`,
 );
-onMounted(() => refresh(true));
+onMounted(async () => {
+  await refresh(true);
+  if (auth.state.username) void poolDeletionController.start();
+});
 </script>
 
 <style scoped>
@@ -1092,6 +1355,61 @@ onMounted(() => refresh(true));
   color: var(--el-color-danger);
 }
 .pool-cooldown { color: var(--el-color-success); }
+.pool-delete-warning {
+  line-height: 1.8;
+  color: var(--el-color-danger);
+}
+.pool-delete-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 14px 0;
+  color: var(--el-text-color-secondary);
+}
+.pool-delete-filters strong {
+  color: var(--el-text-color-primary);
+}
+.pool-delete-count {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 14px 0;
+}
+.pool-delete-preview {
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+.pool-delete-preview__row,
+.pool-delete-waits,
+.pool-delete-failures {
+  display: grid;
+  gap: 4px;
+  line-height: 1.6;
+  margin: 4px 0;
+}
+.pool-delete-preview__row {
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.7fr);
+  gap: 12px;
+}
+.pool-delete-preview__row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pool-delete-progress__header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.pool-delete-waits,
+.pool-delete-failures {
+  margin-top: 14px;
+  color: var(--el-text-color-secondary);
+}
 .el-pagination {
   margin-top: 20px;
   overflow-x: auto;

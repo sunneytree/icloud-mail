@@ -1,0 +1,46 @@
+VERIFICATION
+
+Feature: 批量删除与详情页单条删除一致；不再因主号本地同步错误阻止 Apple 批量删除
+Branch: icloud-git-new
+Changed fields/routes:
+- internal/httpserver/admin_alias_delete.go: 批量删除预检保留邮箱归属、Apple 登录会话、待目录确认校验；移除 LastSyncStatus/LastSyncError 阻断。
+- web/src/views/AliasesView.vue: 批量删除前端仅阻断非 iCloud 主号和未登录会话；移除同步错误阻断提示。
+- docs/openapi.yaml: 移除不再返回的 BATCH_DELETE_NOT_ELIGIBLE 错误码。
+
+Artifacts (absolute paths):
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-sync-error-batch-delete-verification/MODIFIED_FILE
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-sync-error-batch-delete-verification/DIFF_FILE
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-sync-error-batch-delete-verification/VERIFICATION.txt
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-sync-error-batch-delete-verification/ROLLBACK.sh
+
+BASELINE
+Command: git worktree add --detach /tmp/icloud-sync-error-baseline-<pid> HEAD; (cd /tmp/icloud-sync-error-baseline-<pid>/web && npm test)
+Input: committed implementation before this change
+Literal result: 248 tests, 248 passed, 0 failed
+Exit status: 0
+Command: (cd /tmp/icloud-sync-error-baseline-<pid> && env GOMAXPROCS=2 GOMEMLIMIT=512MiB go test -p 1 -parallel 2 ./internal/httpserver)
+Input: committed Go HTTP server implementation before this change
+Literal output: ok icloud-api/internal/httpserver 15.563s
+Exit status: 0
+
+MODIFIED
+Command: npm test (web/)
+Input: current working-tree frontend tests, including sync-error allowance coverage
+Literal result: 250 tests, 250 passed, 0 failed
+Exit status: 0
+Command: env GOMAXPROCS=2 GOMEMLIMIT=512MiB go test -p 1 -parallel 2 ./internal/httpserver
+Input: current working-tree Go HTTP server tests, including sync-error allowance coverage
+Literal output: ok icloud-api/internal/httpserver 16.025s
+Exit status: 0
+Command: git diff --check
+Input: current working-tree patch
+Literal output: (empty)
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-sync-error-batch-delete-verification/ROLLBACK.sh /tmp/icloud-sync-error-rollback-<pid>
+Input: second detached HEAD worktree with DIFF_FILE applied first
+Literal output: rollback applied; git status --short empty
+Exit status: 0
+
+Restored behavior/status: rollback copy returned clean to HEAD; live working tree remains on branch icloud-git-new with the modified batch-delete behavior. A主号的同步错误仍会保留并显示，但不再作为批量删除的前置阻断；Apple 会话失效、非 iCloud 主号、待目录确认仍按原逻辑阻止。

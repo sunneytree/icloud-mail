@@ -28,6 +28,7 @@ type aliasDeletionJobRuntime struct {
 	mu              sync.Mutex
 	ctx             context.Context
 	active          map[aliasDeletionJobKey]struct{}
+	cancels         map[aliasDeletionJobKey]context.CancelFunc
 	waits           map[aliasDeletionJobKey]map[int64]adminAPIAliasDeletionWaitDTO
 	admission       chan struct{}
 	stopping        bool
@@ -78,6 +79,7 @@ func (s *Server) StartAliasDeletionJobs(ctx context.Context) error {
 	}
 	runtime.ctx = ctx
 	runtime.active = make(map[aliasDeletionJobKey]struct{})
+	runtime.cancels = make(map[aliasDeletionJobKey]context.CancelFunc)
 	return nil
 }
 
@@ -231,20 +233,27 @@ func (s *Server) adminAPIStartAliasDeletionJob(c *gin.Context, admin domain.Sess
 	}
 	key := aliasDeletionJobKey{adminID: job.AdminID, id: job.ID}
 	runtime.active[key] = struct{}{}
-	runtime.wg.Add(1)
 	workerContext := runtime.ctx
+	jobContext, cancelJob := context.WithCancel(workerContext)
+	if runtime.cancels == nil {
+		runtime.cancels = make(map[aliasDeletionJobKey]context.CancelFunc)
+	}
+	runtime.cancels[key] = cancelJob
+	runtime.wg.Add(1)
 	// Copy before starting the worker: the worker mutates its own item slice.
 	dto := adminAPIAliasDeletionJobFromRecord(job)
 	job.Items = append([]domain.AliasDeletionJobItem(nil), job.Items...)
 	runtime.mu.Unlock()
 	go func() {
 		defer func() {
+			cancelJob()
 			runtime.mu.Lock()
 			delete(runtime.active, key)
+			delete(runtime.cancels, key)
 			runtime.mu.Unlock()
 			runtime.wg.Done()
 		}()
-		s.runAliasDeletionJob(workerContext, job, admin, sessionHash, ip)
+		s.runAliasDeletionJob(jobContext, job, admin, sessionHash, ip)
 	}()
 	writeAdminAPIData(c, http.StatusAccepted, dto)
 }
@@ -300,6 +309,45 @@ func (s *Server) adminAPIGetLatestAliasDeletionJob(c *gin.Context) {
 		return
 	}
 	writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
+}
+
+// adminAPICancelAliasDeletionJob requests cooperative cancellation of an
+// accepted background Apple deletion job. The worker stops before starting any
+// new mailbox operation and persists the interrupted state; an in-flight Apple
+// request may still finish and is reconciled by the worker before it exits.
+func (s *Server) adminAPICancelAliasDeletionJob(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	id := c.Param("jobID")
+	if !validAliasDeletionJobID(id) {
+		writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "删除任务不存在")
+		return
+	}
+	admin := mustSession(c)
+	job, err := s.store.GetAliasDeletionJob(c.Request.Context(), id, admin.AdminID)
+	if err != nil {
+		s.writeAdminAPIStoreReadError(c, err)
+		return
+	}
+	if !aliasDeletionJobActive(job.Status) {
+		writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
+		return
+	}
+	key := aliasDeletionJobKey{adminID: admin.AdminID, id: id}
+	runtime := &s.aliasDeletionJobs
+	runtime.mu.Lock()
+	cancel := runtime.cancels[key]
+	runtime.mu.Unlock()
+	if cancel == nil {
+		writeAdminAPIError(c, http.StatusConflict, "BATCH_DELETE_UNAVAILABLE", "任务当前不支持取消，请刷新任务状态")
+		return
+	}
+	cancel()
+	job, err = s.store.GetAliasDeletionJob(c.Request.Context(), id, admin.AdminID)
+	if err != nil {
+		s.writeAdminAPIStoreReadError(c, err)
+		return
+	}
+	writeAdminAPIData(c, http.StatusAccepted, s.adminAPIAliasDeletionJobSnapshot(job))
 }
 
 func adminAPIAliasDeletionJobFromRecord(job domain.AliasDeletionJob) adminAPIAliasDeletionJobDTO {

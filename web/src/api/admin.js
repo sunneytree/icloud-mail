@@ -1301,6 +1301,18 @@ export async function getLatestAliasDeletionJob(options = {}) {
   return normalizeAliasDeletionJob(data);
 }
 
+export async function cancelAliasDeletionJob(jobId, csrfToken, options = {}) {
+  const data = await apiRequest(
+    `/aliases/batch/jobs/${encodeURIComponent(jobId)}/cancel`,
+    {
+      method: "POST",
+      csrfToken,
+      signal: options.signal,
+    },
+  );
+  return normalizeAliasDeletionJob(data);
+}
+
 export async function getAuditLogs(options = {}) {
   const query = listQuery(options);
   const data = await apiRequest(`/audit?${query}`, {

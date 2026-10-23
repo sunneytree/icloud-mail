@@ -1320,6 +1320,67 @@ paths:
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
+  /api/v1/aliases/batch/jobs/{jobID}/cancel:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: keys 卷中管理路径去掉首尾斜杠后的值
+      - url: https://HOST/admin
+        description: 固定兼容入口；会话认证和访问隔离规则相同
+    post:
+      tags: [Administration]
+      operationId: cancelAliasBatchDeleteJob
+      summary: 请求取消当前管理员的批量 Apple 删除任务
+      description: |
+        仅 active（queued/running）任务可取消。服务端执行协作取消：当前 Apple 请求可能完成，
+        随后停止启动新的邮箱操作并将任务标记为 interrupted；已发出的远端操作不回滚。
+      security:
+        - adminSession: []
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          description: 原提交的 operation_id，即 job_id。
+          schema:
+            type: string
+            minLength: 16
+            maxLength: 128
+            pattern: '^[A-Za-z0-9_-]{16,128}$'
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      responses:
+        "202":
+          description: 已请求取消，返回当前任务快照；继续轮询直到 interrupted。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminAliasBatchDeleteCacheControl"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAliasBatchDeleteJobResponse"
+        "200":
+          description: 任务已经是终态，返回终态快照。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAliasBatchDeleteJobResponse"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "404":
+          $ref: "#/components/responses/AdminAliasOrMailGroupNotFound"
+        "409":
+          description: 运行实例不可用，无法发出取消请求。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIErrorEnvelope"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
   /api/v1/aliases/{id}/group:
     servers:
       - url: https://HOST/{admin_path}
@@ -2067,7 +2128,6 @@ components:
             - ALIAS_LIMIT_REACHED
             - CUSTOM_MAILBOX_NO_APPLE
             - CUSTOM_MAILBOX_REQUIRED
-            - BATCH_DELETE_NOT_ELIGIBLE
             - BATCH_DELETE_IN_PROGRESS
             - BATCH_DELETE_BUSY
             - BATCH_DELETE_UNAVAILABLE

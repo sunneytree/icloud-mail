@@ -1,0 +1,46 @@
+VERIFICATION
+
+Feature: 邮箱池当前筛选结果批量永久删除、确认预览、后台进度、协作取消
+Branch: icloud-git-new
+Changed fields/routes: alias deletion job runtime cancellation; POST /aliases/batch/jobs/:jobID/cancel; PoolView current-filter batch action
+
+Artifacts (absolute paths):
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-batch-delete-verification/MODIFIED_FILE
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-batch-delete-verification/DIFF_FILE
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-batch-delete-verification/VERIFICATION.txt
+- /Users/xue/Documents/ChatGPT/icloud-创建，项目2/icloud-mail/.codex-batch-delete-verification/ROLLBACK.sh
+
+BASELINE
+Command: git show HEAD:web/src/views/PoolView.vue | shasum -a 256
+Input: committed PoolView before this feature
+Literal output: 9b9664753ae0f2957a4fec68962063930a7bccc7d6fbd167c26496d26c7830b3  -
+Exit status: 0
+
+MODIFIED
+Command: cp web/src/views/PoolView.vue .codex-batch-delete-verification/MODIFIED_FILE && git diff --binary > .codex-batch-delete-verification/DIFF_FILE
+Input: current working-tree implementation
+Literal result: MODIFIED_FILE sha256=265f83b949b9ef0f42ca9de9848daa7c6637d34055b28762ad3ea6dfeae2782e; DIFF_FILE sha256=29f90948d5f07ff8f6e23d31e25224f3bf6d2358e0c4355214aafd5d4a6cee7d
+Exit status: 0
+
+Command: npm test (web/)
+Input: frontend unit/static tests
+Literal result: 249 tests, 249 passed, 0 failed
+Exit status: 0
+
+Command: npm run build (web/)
+Input: production Vite build
+Literal result: ✓ built in 3.06s
+Exit status: 0
+
+Command: env GOMAXPROCS=2 GOMEMLIMIT=512MiB go test -p 1 -parallel 2 ./internal/httpserver
+Input: Go HTTP server tests, including owner cancellation
+Literal result: ok icloud-api/internal/httpserver 13.667s
+Exit status: 0
+
+ROLLBACK
+Command: .codex-batch-delete-verification/ROLLBACK.sh <temporary git worktree>
+Input: temporary worktree created at HEAD, DIFF_FILE applied first
+Literal output: rollback applied
+Exit status: 0
+
+Restored behavior/status: temporary worktree status was clean after rollback (no remaining changes). The live working tree remains on the modified feature branch. Cancellation is cooperative: an in-flight Apple request may finish; no new mailbox operation starts after cancellation and the job becomes interrupted.

@@ -103,6 +103,7 @@ export function createAliasDeletionController({
   startJob,
   getJob,
   getLatestJob,
+  cancelJob,
   storage,
   onChange = () => {},
   createOperationId = createAliasDeletionOperationId,
@@ -117,6 +118,7 @@ export function createAliasDeletionController({
     operationId: pending?.operationId || "",
     recovering: true,
     submitting: false,
+    cancelling: false,
     checking: false,
     uncertain: Boolean(pending),
     unmatched: false,
@@ -133,7 +135,7 @@ export function createAliasDeletionController({
     if (stopped) return;
     state = { ...state, ...patch, operationId: pending?.operationId || "" };
     state.blocked = state.recovering || state.submitting || state.checking ||
-      state.uncertain || isAliasDeletionJobActive(state.job);
+      state.uncertain || state.cancelling || isAliasDeletionJobActive(state.job);
     onChange(state);
   }
 
@@ -259,6 +261,28 @@ export function createAliasDeletionController({
         else schedule();
       }
       return true;
+    },
+    async cancel(csrfToken) {
+      if (stopped || state.cancelling || state.submitting || inFlight ||
+          !isAliasDeletionJobActive(state.job) || typeof cancelJob !== "function") {
+        return false;
+      }
+      clearTimer();
+      update({ cancelling: true, error: null });
+      try {
+        const job = await shortRequest(
+          (options) => cancelJob(state.job.jobId, csrfToken, options),
+        );
+        if (stopped) return false;
+        accept(validJob(job, state.job.jobId));
+        return true;
+      } catch (error) {
+        if (!stopped) update({ error });
+        return false;
+      } finally {
+        update({ cancelling: false });
+        if (!stopped) schedule();
+      }
     },
     // Explicit reconciliation only; it clears selection in the view and never retries DELETE.
     acknowledgeUnmatched() {

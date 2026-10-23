@@ -470,7 +470,7 @@ func TestAdminAPIBatchDeleteAliasesRejectsCustomMailbox(t *testing.T) {
 	}
 }
 
-func TestAdminAPIBatchDeleteAliasesRejectsSyncError(t *testing.T) {
+func TestAdminAPIBatchDeleteAliasesAllowsSyncError(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-sync-error-admin", "unused-password")
 	account := adminAPITestCreateAccount(t, env, "batch-delete-sync-error@icloud.com")
@@ -481,23 +481,28 @@ func TestAdminAPIBatchDeleteAliasesRejectsSyncError(t *testing.T) {
 	deleteCalled := false
 	env.server.SetHMESyncService(&fakeHMESyncService{
 		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
-			t.Fatal("sync-error account reached Apple session preflight")
-			return hmesync.SessionInfo{}, nil
+			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
 		},
-		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+		deleteAliases: func(ctx context.Context, ids []int64) ([]hmesync.AliasDeletionOutcome, error) {
 			deleteCalled = true
-			return nil, nil
+			if len(ids) != 1 || ids[0] != alias.ID {
+				t.Fatalf("sync-error batch delete IDs = %v", ids)
+			}
+			if err := env.store.DeleteAlias(ctx, alias.ID); err != nil {
+				return nil, err
+			}
+			return []hmesync.AliasDeletionOutcome{{AliasID: alias.ID}}, nil
 		},
 	})
 
 	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
 		"alias_ids": []int64{alias.ID},
 	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
-	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "BATCH_DELETE_NOT_ELIGIBLE" || deleteCalled {
+	if response.Code != http.StatusOK || !deleteCalled {
 		t.Fatalf("sync-error batch delete = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
 	}
-	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
-		t.Fatalf("sync-error preflight removed local alias: %v", err)
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sync-error batch delete did not remove alias: %v", err)
 	}
 }
 

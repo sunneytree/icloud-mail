@@ -1,0 +1,150 @@
+diff --git a/internal/httpserver/admin_alias_delete.go b/internal/httpserver/admin_alias_delete.go
+index a7b1fd2..9aff3c1 100644
+--- a/internal/httpserver/admin_alias_delete.go
++++ b/internal/httpserver/admin_alias_delete.go
+@@ -5,7 +5,6 @@ import (
+ 	"errors"
+ 	"net/http"
+ 	"strconv"
+-	"strings"
+ 
+ 	"github.com/gin-gonic/gin"
+ 
+@@ -190,16 +189,6 @@ func (s *Server) adminAPIPreflightAliasBatchDelete(
+ 			})
+ 			return nil, false
+ 		}
+-		if strings.EqualFold(strings.TrimSpace(account.LastSyncStatus), domain.SyncStatusError) ||
+-			strings.TrimSpace(account.LastSyncError) != "" {
+-			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, adminAPIAppleError{
+-				Status:  http.StatusConflict,
+-				Code:    "BATCH_DELETE_NOT_ELIGIBLE",
+-				Message: "该 iCloud 主号存在同步错误，请先处理错误后再批量删除",
+-			})
+-			return nil, false
+-		}
+-
+ 		info, err := s.hmeSync.GetSession(c.Request.Context(), accountID)
+ 		if err != nil {
+ 			s.adminAPIFinishBatchAliasDeleteFailure(c, adminSession, classifyAdminAPIAppleError(err))
+diff --git a/internal/httpserver/admin_apple_api_test.go b/internal/httpserver/admin_apple_api_test.go
+index 7906776..81e676d 100644
+--- a/internal/httpserver/admin_apple_api_test.go
++++ b/internal/httpserver/admin_apple_api_test.go
+@@ -470,7 +470,7 @@ func TestAdminAPIBatchDeleteAliasesRejectsCustomMailbox(t *testing.T) {
+ 	}
+ }
+ 
+-func TestAdminAPIBatchDeleteAliasesRejectsSyncError(t *testing.T) {
++func TestAdminAPIBatchDeleteAliasesAllowsSyncError(t *testing.T) {
+ 	env := newAdminAPITestEnv(t)
+ 	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-sync-error-admin", "unused-password")
+ 	account := adminAPITestCreateAccount(t, env, "batch-delete-sync-error@icloud.com")
+@@ -481,23 +481,28 @@ func TestAdminAPIBatchDeleteAliasesRejectsSyncError(t *testing.T) {
+ 	deleteCalled := false
+ 	env.server.SetHMESyncService(&fakeHMESyncService{
+ 		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+-			t.Fatal("sync-error account reached Apple session preflight")
+-			return hmesync.SessionInfo{}, nil
++			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
+ 		},
+-		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
++		deleteAliases: func(ctx context.Context, ids []int64) ([]hmesync.AliasDeletionOutcome, error) {
+ 			deleteCalled = true
+-			return nil, nil
++			if len(ids) != 1 || ids[0] != alias.ID {
++				t.Fatalf("sync-error batch delete IDs = %v", ids)
++			}
++			if err := env.store.DeleteAlias(ctx, alias.ID); err != nil {
++				return nil, err
++			}
++			return []hmesync.AliasDeletionOutcome{{AliasID: alias.ID}}, nil
+ 		},
+ 	})
+ 
+ 	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+ 		"alias_ids": []int64{alias.ID},
+ 	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+-	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "BATCH_DELETE_NOT_ELIGIBLE" || deleteCalled {
++	if response.Code != http.StatusOK || !deleteCalled {
+ 		t.Fatalf("sync-error batch delete = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
+ 	}
+-	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+-		t.Fatalf("sync-error preflight removed local alias: %v", err)
++	if _, err := env.store.GetAlias(context.Background(), alias.ID); !errors.Is(err, store.ErrNotFound) {
++		t.Fatalf("sync-error batch delete did not remove alias: %v", err)
+ 	}
+ }
+ 
+diff --git a/web/src/views/AliasesView.vue b/web/src/views/AliasesView.vue
+index 5b628e5..9530ee8 100644
+--- a/web/src/views/AliasesView.vue
++++ b/web/src/views/AliasesView.vue
+@@ -1255,12 +1255,7 @@ function batchDeleteAccountState(detail) {
+   const mailboxType = String(account?.mailboxType || "")
+     .trim()
+     .toLowerCase();
+-  const status = String(account?.lastSyncStatus || "")
+-    .trim()
+-    .toLowerCase();
+-  const syncError = String(account?.lastSyncError || "").trim();
+   if (mailboxType !== "icloud") return "custom";
+-  if (status === "error" || syncError) return "error";
+   if (detail?.appleSession?.status !== "authenticated") return "login";
+   return "ok";
+ }
+@@ -1311,10 +1306,6 @@ async function deleteSelectedAliases() {
+       ElMessage.warning("批量删除仅支持 Apple 已登录的 iCloud 主号。");
+       return;
+     }
+-    if (states.includes("error")) {
+-      ElMessage.warning("所选 iCloud 主号存在同步错误，请先处理错误后再批量删除。");
+-      return;
+-    }
+     if (states.includes("login")) {
+       ElMessage.warning("请先让所选 iCloud 主号完成 Apple 登录，再批量删除隐私邮箱。");
+       return;
+diff --git a/web/test/alias-deletion-view.test.js b/web/test/alias-deletion-view.test.js
+index 7c5b383..6b00343 100644
+--- a/web/test/alias-deletion-view.test.js
++++ b/web/test/alias-deletion-view.test.js
+@@ -132,7 +132,7 @@ test("each distinct account is checked once and a blocked recovery never opens c
+   }
+ });
+ 
+-test("stale selection, Apple-directory pending, custom, errored and logged-out accounts stay blocked", async () => {
++test("stale selection, Apple-directory pending, custom and logged-out accounts stay blocked", async () => {
+   const stale = harness({ selectedAliasIds: { value: [91, 99] } });
+   await stale.run();
+   assert.deepEqual(stale.events, ["clear"]);
+@@ -143,8 +143,6 @@ test("stale selection, Apple-directory pending, custom, errored and logged-out a
+   assert.equal(pending.warnings.length, 1);
+   for (const detail of [
+     { account: { mailboxType: "custom" } },
+-    { account: { mailboxType: "icloud", lastSyncStatus: "error" } },
+-    { account: { mailboxType: "icloud", lastSyncError: "sync error" } },
+     { account: { mailboxType: "icloud" }, appleSession: { status: "expired" } },
+   ]) {
+     const blocked = harness({ getAccount: async () => detail });
+@@ -154,6 +152,21 @@ test("stale selection, Apple-directory pending, custom, errored and logged-out a
+   }
+ });
+ 
++test("sync errors do not block batch deletion when the Apple session is authenticated", async () => {
++  const view = harness({
++    getAccount: async () => ({
++      account: { mailboxType: "icloud", lastSyncStatus: "error", lastSyncError: "sync error" },
++      appleSession: { status: "authenticated" },
++    }),
++  });
++  await view.run();
++  assert.deepEqual(view.events, [
++    "stop", "begin", "confirm", "prompt", "submit", "clear", "restart",
++  ]);
++  assert.deepEqual(view.warnings, []);
++  assert.deepEqual(view.errors, []);
++});
++
+ test("cancelling either dangerous confirmation never submits", async () => {
+   for (const stage of ["confirm", "prompt"]) {
+     const cancelled = harness({ ElMessageBox: {

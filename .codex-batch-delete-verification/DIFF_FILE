@@ -1,0 +1,762 @@
+diff --git a/docs/REFERENCE.md b/docs/REFERENCE.md
+index 1ff339f..62ad878 100644
+--- a/docs/REFERENCE.md
++++ b/docs/REFERENCE.md
+@@ -91,6 +91,7 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
+ | `DELETE /aliases/batch?async=1`，正文含 `alias_ids` 和 `operation_id` | `202 data {job_id,status,requested,processed,deleted,failed,results,request_id,created_at,updated_at}` | 提交后台任务，或取得幂等重试对应的原任务 |
+ | `GET /aliases/batch/jobs/latest` | `200 data` 为任务对象或 `null` | 优先返回当前管理员的 active 任务，否则返回按创建时间最近的任务；没有任务时为 `null` |
+ | `GET /aliases/batch/jobs/:jobID` | `200 data` 为任务对象 | 按 ID 轮询；ID 格式无效或当前管理员名下无该任务时返回 `404`，不泄露其他管理员的同 ID 任务 |
++| `POST /aliases/batch/jobs/:jobID/cancel` | `202 data` 为任务快照 | 请求协作取消 active 任务；当前 Apple 请求完成后停止后续邮箱，已发出的结果不回滚 |
+ 
+ 异步请求示例正文：
+ 
+diff --git a/docs/openapi.yaml b/docs/openapi.yaml
+index 8be62a6..7f940f0 100644
+--- a/docs/openapi.yaml
++++ b/docs/openapi.yaml
+@@ -1320,6 +1320,67 @@ paths:
+         "500":
+           $ref: "#/components/responses/AdminInternalError"
+ 
++  /api/v1/aliases/batch/jobs/{jobID}/cancel:
++    servers:
++      - url: https://HOST/{admin_path}
++        description: 首选的安装级随机管理 API 前缀
++        variables:
++          admin_path:
++            default: 00000000000000000000000000000000/admin
++            description: keys 卷中管理路径去掉首尾斜杠后的值
++      - url: https://HOST/admin
++        description: 固定兼容入口；会话认证和访问隔离规则相同
++    post:
++      tags: [Administration]
++      operationId: cancelAliasBatchDeleteJob
++      summary: 请求取消当前管理员的批量 Apple 删除任务
++      description: |
++        仅 active（queued/running）任务可取消。服务端执行协作取消：当前 Apple 请求可能完成，
++        随后停止启动新的邮箱操作并将任务标记为 interrupted；已发出的远端操作不回滚。
++      security:
++        - adminSession: []
++      parameters:
++        - name: jobID
++          in: path
++          required: true
++          description: 原提交的 operation_id，即 job_id。
++          schema:
++            type: string
++            minLength: 16
++            maxLength: 128
++            pattern: '^[A-Za-z0-9_-]{16,128}$'
++        - $ref: "#/components/parameters/AdminCSRFToken"
++      responses:
++        "202":
++          description: 已请求取消，返回当前任务快照；继续轮询直到 interrupted。
++          headers:
++            X-Request-ID:
++              $ref: "#/components/headers/RequestID"
++            Cache-Control:
++              $ref: "#/components/headers/AdminAliasBatchDeleteCacheControl"
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/AdminAliasBatchDeleteJobResponse"
++        "200":
++          description: 任务已经是终态，返回终态快照。
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/AdminAliasBatchDeleteJobResponse"
++        "401":
++          $ref: "#/components/responses/AdminAuthUnauthorized"
++        "404":
++          $ref: "#/components/responses/AdminAliasOrMailGroupNotFound"
++        "409":
++          description: 运行实例不可用，无法发出取消请求。
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/APIErrorEnvelope"
++        "500":
++          $ref: "#/components/responses/AdminInternalError"
++
+   /api/v1/aliases/{id}/group:
+     servers:
+       - url: https://HOST/{admin_path}
+diff --git a/internal/httpserver/admin_alias_delete_jobs.go b/internal/httpserver/admin_alias_delete_jobs.go
+index 46c4eff..1dccddc 100644
+--- a/internal/httpserver/admin_alias_delete_jobs.go
++++ b/internal/httpserver/admin_alias_delete_jobs.go
+@@ -28,6 +28,7 @@ type aliasDeletionJobRuntime struct {
+ 	mu              sync.Mutex
+ 	ctx             context.Context
+ 	active          map[aliasDeletionJobKey]struct{}
++	cancels         map[aliasDeletionJobKey]context.CancelFunc
+ 	waits           map[aliasDeletionJobKey]map[int64]adminAPIAliasDeletionWaitDTO
+ 	admission       chan struct{}
+ 	stopping        bool
+@@ -78,6 +79,7 @@ func (s *Server) StartAliasDeletionJobs(ctx context.Context) error {
+ 	}
+ 	runtime.ctx = ctx
+ 	runtime.active = make(map[aliasDeletionJobKey]struct{})
++	runtime.cancels = make(map[aliasDeletionJobKey]context.CancelFunc)
+ 	return nil
+ }
+ 
+@@ -231,20 +233,27 @@ func (s *Server) adminAPIStartAliasDeletionJob(c *gin.Context, admin domain.Sess
+ 	}
+ 	key := aliasDeletionJobKey{adminID: job.AdminID, id: job.ID}
+ 	runtime.active[key] = struct{}{}
+-	runtime.wg.Add(1)
+ 	workerContext := runtime.ctx
++	jobContext, cancelJob := context.WithCancel(workerContext)
++	if runtime.cancels == nil {
++		runtime.cancels = make(map[aliasDeletionJobKey]context.CancelFunc)
++	}
++	runtime.cancels[key] = cancelJob
++	runtime.wg.Add(1)
+ 	// Copy before starting the worker: the worker mutates its own item slice.
+ 	dto := adminAPIAliasDeletionJobFromRecord(job)
+ 	job.Items = append([]domain.AliasDeletionJobItem(nil), job.Items...)
+ 	runtime.mu.Unlock()
+ 	go func() {
+ 		defer func() {
++			cancelJob()
+ 			runtime.mu.Lock()
+ 			delete(runtime.active, key)
++			delete(runtime.cancels, key)
+ 			runtime.mu.Unlock()
+ 			runtime.wg.Done()
+ 		}()
+-		s.runAliasDeletionJob(workerContext, job, admin, sessionHash, ip)
++		s.runAliasDeletionJob(jobContext, job, admin, sessionHash, ip)
+ 	}()
+ 	writeAdminAPIData(c, http.StatusAccepted, dto)
+ }
+@@ -302,6 +311,45 @@ func (s *Server) adminAPIGetLatestAliasDeletionJob(c *gin.Context) {
+ 	writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
+ }
+ 
++// adminAPICancelAliasDeletionJob requests cooperative cancellation of an
++// accepted background Apple deletion job. The worker stops before starting any
++// new mailbox operation and persists the interrupted state; an in-flight Apple
++// request may still finish and is reconciled by the worker before it exits.
++func (s *Server) adminAPICancelAliasDeletionJob(c *gin.Context) {
++	c.Header("Cache-Control", "no-store")
++	id := c.Param("jobID")
++	if !validAliasDeletionJobID(id) {
++		writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "删除任务不存在")
++		return
++	}
++	admin := mustSession(c)
++	job, err := s.store.GetAliasDeletionJob(c.Request.Context(), id, admin.AdminID)
++	if err != nil {
++		s.writeAdminAPIStoreReadError(c, err)
++		return
++	}
++	if !aliasDeletionJobActive(job.Status) {
++		writeAdminAPIData(c, http.StatusOK, s.adminAPIAliasDeletionJobSnapshot(job))
++		return
++	}
++	key := aliasDeletionJobKey{adminID: admin.AdminID, id: id}
++	runtime := &s.aliasDeletionJobs
++	runtime.mu.Lock()
++	cancel := runtime.cancels[key]
++	runtime.mu.Unlock()
++	if cancel == nil {
++		writeAdminAPIError(c, http.StatusConflict, "BATCH_DELETE_UNAVAILABLE", "任务当前不支持取消，请刷新任务状态")
++		return
++	}
++	cancel()
++	job, err = s.store.GetAliasDeletionJob(c.Request.Context(), id, admin.AdminID)
++	if err != nil {
++		s.writeAdminAPIStoreReadError(c, err)
++		return
++	}
++	writeAdminAPIData(c, http.StatusAccepted, s.adminAPIAliasDeletionJobSnapshot(job))
++}
++
+ func adminAPIAliasDeletionJobFromRecord(job domain.AliasDeletionJob) adminAPIAliasDeletionJobDTO {
+ 	dto := adminAPIAliasDeletionJobDTO{
+ 		JobID: job.ID, Status: job.Status, RequestID: job.RequestID,
+diff --git a/internal/httpserver/admin_alias_delete_jobs_test.go b/internal/httpserver/admin_alias_delete_jobs_test.go
+index f0d862d..906d8a3 100644
+--- a/internal/httpserver/admin_alias_delete_jobs_test.go
++++ b/internal/httpserver/admin_alias_delete_jobs_test.go
+@@ -203,6 +203,49 @@ func TestAliasDeletionJobReturnsBeforeAppleAndSurvivesRequestCancellation(t *tes
+ 	}
+ }
+ 
++func TestAliasDeletionJobCanBeCancelledByOwner(t *testing.T) {
++	env := newAdminAPITestEnv(t)
++	cookie, csrf, admin := env.createSession(t, "async-cancel-admin", "unused-password")
++	account := adminAPITestCreateAccount(t, env, "async-cancel@icloud.com")
++	first := adminAPITestCreateDeleteAlias(t, env, account.ID, "async-cancel-first@icloud.com")
++	second := adminAPITestCreateDeleteAlias(t, env, account.ID, "async-cancel-second@icloud.com")
++	startTestAliasDeletionJobs(t, env)
++	entered := make(chan struct{})
++	var calls atomic.Int32
++	env.server.SetHMESyncService(&fakeHMESyncService{
++		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
++			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
++		},
++		deleteAliases: func(ctx context.Context, ids []int64) ([]hmesync.AliasDeletionOutcome, error) {
++			calls.Add(1)
++			close(entered)
++			<-ctx.Done()
++			return []hmesync.AliasDeletionOutcome{{AliasID: ids[0], Err: ctx.Err()}}, ctx.Err()
++		},
++	})
++	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch?async=1", adminAPITestJSON(t, map[string]any{
++		"alias_ids": []int64{first.ID, second.ID}, "operation_id": "cancel-alias-delete-operation",
++	}), "application/json", []*http.Cookie{cookie}, csrf)
++	if response.Code != http.StatusAccepted {
++		t.Fatalf("admission = %d %s", response.Code, response.Body.String())
++	}
++	waitTestAliasDeletionSignal(t, entered)
++	cancel := env.request(t, http.MethodPost, "/admin/api/v1/aliases/batch/jobs/cancel-alias-delete-operation/cancel", nil, "", []*http.Cookie{cookie}, csrf)
++	if cancel.Code != http.StatusAccepted {
++		t.Fatalf("cancel = %d %s", cancel.Code, cancel.Body.String())
++	}
++	job := waitTestAliasDeletionJob(t, env, admin.ID, "cancel-alias-delete-operation")
++	if calls.Load() != 1 || job.Status != domain.AliasDeletionJobInterrupted || !job.Items[0].Done || job.Items[0].Code != "BATCH_DELETE_INTERRUPTED" || job.Items[1].Done {
++		t.Fatalf("cancelled job continued or published uncommitted work: calls=%d job=%#v", calls.Load(), job)
++	}
++	if _, err := env.store.GetAlias(context.Background(), first.ID); err != nil {
++		t.Fatalf("cancelled first alias was removed: %v", err)
++	}
++	if _, err := env.store.GetAlias(context.Background(), second.ID); err != nil {
++		t.Fatalf("cancelled second alias was removed: %v", err)
++	}
++}
++
+ func TestAliasDeletionJobShutdownPersistsConfirmedResults(t *testing.T) {
+ 	env := newAdminAPITestEnv(t)
+ 	cookie, csrf, admin := env.createSession(t, "async-stop-admin", "unused-password")
+diff --git a/internal/httpserver/admin_api.go b/internal/httpserver/admin_api.go
+index 7324021..3d60543 100644
+--- a/internal/httpserver/admin_api.go
++++ b/internal/httpserver/admin_api.go
+@@ -104,6 +104,7 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
+ 	protected.DELETE("/aliases/batch", s.adminAPIDeleteAliases)
+ 	protected.GET("/aliases/batch/jobs/latest", s.adminAPIGetLatestAliasDeletionJob)
+ 	protected.GET("/aliases/batch/jobs/:jobID", s.adminAPIGetAliasDeletionJob)
++	protected.POST("/aliases/batch/jobs/:jobID/cancel", s.adminAPICancelAliasDeletionJob)
+ 	protected.GET("/aliases/:id", s.adminAPIGetAlias)
+ 	protected.POST("/aliases/:id/rotate-key", s.adminAPIRotateAliasKey)
+ 	protected.POST("/aliases/:id/rotate-credentials", s.adminAPIRotateAliasCredentials)
+diff --git a/internal/httpserver/middleware.go b/internal/httpserver/middleware.go
+index d01a656..9ef700e 100644
+--- a/internal/httpserver/middleware.go
++++ b/internal/httpserver/middleware.go
+@@ -91,7 +91,7 @@ var httpOperations = map[string]string{
+ 	"GET /accounts/:id/aliases/auto-create/keys": "读取新邮箱凭据", "DELETE /accounts/:id/aliases/auto-create/keys": "确认领取新邮箱凭据",
+ 	"POST /accounts/:id/aliases": "登记已有邮箱", "POST /accounts/:id/aliases/random": "生成自定义邮箱", "POST /accounts/:id/aliases/batch": "批量生成自定义邮箱", "POST /accounts/:id/aliases/generate": "生成自定义邮箱", "POST /accounts/:id/aliases/sync": "同步 Apple 隐私邮箱目录",
+ 	"GET /groups": "读取邮箱分组", "POST /groups": "创建邮箱分组", "PATCH /groups/:id": "重命名邮箱分组", "DELETE /groups/:id": "删除邮箱分组",
+-	"PATCH /aliases/group": "批量移动邮箱分组", "PATCH /aliases/:id/group": "移动邮箱分组", "DELETE /aliases/batch": "提交 Apple 批量永久删除", "GET /aliases/batch/jobs/latest": "恢复最近批量删除任务", "GET /aliases/batch/jobs/:jobID": "读取批量删除进度",
++	"PATCH /aliases/group": "批量移动邮箱分组", "PATCH /aliases/:id/group": "移动邮箱分组", "DELETE /aliases/batch": "提交 Apple 批量永久删除", "GET /aliases/batch/jobs/latest": "恢复最近批量删除任务", "GET /aliases/batch/jobs/:jobID": "读取批量删除进度", "POST /aliases/batch/jobs/:jobID/cancel": "取消批量删除任务",
+ 	"POST /aliases/rotate-all-credentials": "轮换全部邮箱凭据", "POST /aliases/:id/rotate-key": "轮换单邮箱 API Key", "POST /aliases/:id/rotate-credentials": "轮换单邮箱完整凭据", "GET /audit": "读取管理操作记录",
+ 	"GET /pool/leases/:leaseID/code": "查询领取邮箱验证码", "POST /pool/leases/:leaseID/commit": "确认使用领取邮箱", "POST /pool/leases/:leaseID/release": "释放领取邮箱并轮换凭据", "POST /pool/leases/:leaseID/renew": "续期领取邮箱",
+ 	"POST /oauth2/v2.0/token": "换取 IMAP OAuth 访问凭据", "GET /docs": "查看 API 文档",
+diff --git a/web/src/api/admin.js b/web/src/api/admin.js
+index b9b1e10..4f6903d 100644
+--- a/web/src/api/admin.js
++++ b/web/src/api/admin.js
+@@ -1301,6 +1301,18 @@ export async function getLatestAliasDeletionJob(options = {}) {
+   return normalizeAliasDeletionJob(data);
+ }
+ 
++export async function cancelAliasDeletionJob(jobId, csrfToken, options = {}) {
++  const data = await apiRequest(
++    `/aliases/batch/jobs/${encodeURIComponent(jobId)}/cancel`,
++    {
++      method: "POST",
++      csrfToken,
++      signal: options.signal,
++    },
++  );
++  return normalizeAliasDeletionJob(data);
++}
++
+ export async function getAuditLogs(options = {}) {
+   const query = listQuery(options);
+   const data = await apiRequest(`/audit?${query}`, {
+diff --git a/web/src/utils/aliasDeletionJob.js b/web/src/utils/aliasDeletionJob.js
+index 54a3e3e..a23a574 100644
+--- a/web/src/utils/aliasDeletionJob.js
++++ b/web/src/utils/aliasDeletionJob.js
+@@ -103,6 +103,7 @@ export function createAliasDeletionController({
+   startJob,
+   getJob,
+   getLatestJob,
++  cancelJob,
+   storage,
+   onChange = () => {},
+   createOperationId = createAliasDeletionOperationId,
+@@ -117,6 +118,7 @@ export function createAliasDeletionController({
+     operationId: pending?.operationId || "",
+     recovering: true,
+     submitting: false,
++    cancelling: false,
+     checking: false,
+     uncertain: Boolean(pending),
+     unmatched: false,
+@@ -133,7 +135,7 @@ export function createAliasDeletionController({
+     if (stopped) return;
+     state = { ...state, ...patch, operationId: pending?.operationId || "" };
+     state.blocked = state.recovering || state.submitting || state.checking ||
+-      state.uncertain || isAliasDeletionJobActive(state.job);
++      state.uncertain || state.cancelling || isAliasDeletionJobActive(state.job);
+     onChange(state);
+   }
+ 
+@@ -260,6 +262,28 @@ export function createAliasDeletionController({
+       }
+       return true;
+     },
++    async cancel(csrfToken) {
++      if (stopped || state.cancelling || state.submitting || inFlight ||
++          !isAliasDeletionJobActive(state.job) || typeof cancelJob !== "function") {
++        return false;
++      }
++      clearTimer();
++      update({ cancelling: true, error: null });
++      try {
++        const job = await shortRequest(
++          (options) => cancelJob(state.job.jobId, csrfToken, options),
++        );
++        if (stopped) return false;
++        accept(validJob(job, state.job.jobId));
++        return true;
++      } catch (error) {
++        if (!stopped) update({ error });
++        return false;
++      } finally {
++        update({ cancelling: false });
++        if (!stopped) schedule();
++      }
++    },
+     // Explicit reconciliation only; it clears selection in the view and never retries DELETE.
+     acknowledgeUnmatched() {
+       if (stopped || !state.unmatched || state.checking) return false;
+diff --git a/web/src/views/PoolView.vue b/web/src/views/PoolView.vue
+index 620dfb4..2220856 100644
+--- a/web/src/views/PoolView.vue
++++ b/web/src/views/PoolView.vue
+@@ -84,6 +84,14 @@
+             <el-button type="primary" @click="openEnroll"
+               >加入已有邮箱</el-button
+             >
++            <el-button
++              type="danger"
++              plain
++              :loading="poolDeleteLoading"
++              :disabled="busy || poolDeleteConfirming || poolDeletionState.recovering || poolDeletionState.uncertain || poolDeletionState.cancelling"
++              @click="openPoolDeleteAction"
++              >{{ poolDeletionActive ? "查看删除进度" : "批量删除当前筛选" }}</el-button
++            >
+           </div>
+           <div class="pool-table-scroll" role="region" aria-label="邮箱库存列表" tabindex="0"><el-table
+             :data="members.items"
+@@ -439,6 +447,93 @@ grant_type=refresh_token&amp;client_id=CLIENT_ID&amp;refresh_token=REFRESH_TOKEN
+         </el-tab-pane>
+       </el-tabs>
+ 
++      <el-dialog
++        v-model="poolDeleteConfirmOpen"
++        title="确认批量删除邮箱池结果"
++        width="min(760px,94vw)"
++        destroy-on-close
++        :close-on-click-modal="false"
++        :close-on-press-escape="!poolDeleteConfirming"
++        :show-close="!poolDeleteConfirming"
++      >
++        <p class="pool-delete-warning">
++          将按当前筛选结果从 Apple 永久删除这些隐私邮箱。同一主号内串行，不同主号最多两个执行名额，并按 Apple 限流策略等待；已发出的邮箱不会因取消而恢复。
++        </p>
++        <div class="pool-delete-filters">
++          <strong>筛选条件</strong>
++          <span v-for="filter in poolDeletePreview.filters" :key="filter.label">{{ filter.label }}：{{ filter.value }}</span>
++        </div>
++        <p class="pool-delete-count">匹配 {{ poolDeletePreview.total }} 个邮箱</p>
++        <div class="pool-delete-preview" role="region" aria-label="待删除邮箱预览">
++          <div v-for="row in poolDeletePreview.items" :key="row.alias_id" class="pool-delete-preview__row">
++            <span>{{ row.address }}</span>
++            <small>{{ row.account_email }}</small>
++          </div>
++          <p v-if="poolDeletePreview.total > poolDeletePreview.items.length" class="pool-hint">
++            仅展示前 {{ poolDeletePreview.items.length }} 个，确认后将处理全部 {{ poolDeletePreview.total }} 个。
++          </p>
++        </div>
++        <template #footer>
++          <el-button :disabled="poolDeleteConfirming" @click="poolDeleteConfirmOpen = false">取消</el-button>
++          <el-button
++            type="danger"
++            :loading="poolDeleteConfirming"
++            :disabled="!poolDeletePreview.ids.length"
++            @click="submitPoolDelete"
++          >确认删除 {{ poolDeletePreview.total }} 个</el-button>
++        </template>
++      </el-dialog>
++
++      <el-dialog
++        v-model="poolDeleteProgressOpen"
++        title="邮箱池批量删除进度"
++        width="min(760px,94vw)"
++        :close-on-click-modal="false"
++      >
++        <template v-if="poolDeletionJob">
++          <div class="pool-delete-progress__header">
++            <el-tag :type="poolDeletionJobType">{{ poolDeletionStatusLabel }}</el-tag>
++            <span v-if="poolDeletionJob.requestId">请求编号：{{ poolDeletionJob.requestId }}</span>
++          </div>
++          <p role="status" aria-live="polite">
++            已处理 {{ poolDeletionJob.processed }} / {{ poolDeletionJob.requested }}；成功删除 {{ poolDeletionJob.deleted }}；失败/未执行 {{ poolDeletionJob.failed }}
++            <span v-if="poolDeletionJob.deferred">（未执行 {{ poolDeletionJob.deferred }}）</span>
++          </p>
++          <el-progress :percentage="poolDeletionPercentage" :show-text="false" aria-label="邮箱池批量删除进度" />
++          <p class="pool-hint">任务 {{ poolDeletionJob.jobId }} · 更新于 {{ date(poolDeletionJob.updatedAt) }}</p>
++          <div v-if="poolDeletionWaits.length" class="pool-delete-waits" role="status" aria-live="polite">
++            <strong>Apple 限流等待</strong>
++            <span v-for="(wait, index) in poolDeletionWaits" :key="`${wait.accountId}:${wait.aliasId}:${index}`">
++              主号 {{ wait.accountId }} · {{ ALIAS_DELETION_OPERATION_LABELS[wait.operation] }} · 下次 {{ formatTime(wait.retryAt, { seconds: true }) }}
++            </span>
++          </div>
++          <div v-if="poolDeletionRecentFailures.length" class="pool-delete-failures">
++            <strong>最近失败或待核对结果</strong>
++            <span v-for="item in poolDeletionRecentFailures" :key="item.id">{{ item.address || `ID ${item.id}` }}：{{ formatAliasDeletionResultMessage(item) }}</span>
++          </div>
++        </template>
++        <p v-else-if="poolDeletionState.recovering">正在恢复最近删除任务，请稍候。</p>
++        <p v-else>当前没有可显示的删除任务。</p>
++        <p v-if="isAliasDeletionJobActive(poolDeletionJob)" class="pool-hint">
++          关闭此窗口不会停止后台任务；可以再次点击“查看删除进度”打开。
++        </p>
++        <template #footer>
++          <el-button
++            :loading="poolDeletionState.checking"
++            :disabled="poolDeletionState.cancelling || poolDeletionState.submitting"
++            @click="poolDeletionController.refresh()"
++          >刷新进度</el-button>
++          <el-button
++            v-if="isAliasDeletionJobActive(poolDeletionJob)"
++            type="warning"
++            :loading="poolDeletionState.cancelling"
++            :disabled="poolDeletionState.checking || poolDeletionState.submitting"
++            @click="cancelPoolDelete"
++          >取消任务</el-button>
++          <el-button @click="poolDeleteProgressOpen = false">关闭</el-button>
++        </template>
++      </el-dialog>
++
+       <el-dialog
+         v-model="enrollOpen"
+         title="加入已有邮箱"
+@@ -544,13 +639,31 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
+ import { ElMessage, ElMessageBox } from "element-plus";
+ import zhCn from "element-plus/es/locale/lang/zh-cn";
+ import { apiRequest } from "../api/client.js";
+-import { getAliasPage, getAllAliases, getAllAccounts } from "../api/admin.js";
++import {
++  cancelAliasDeletionJob,
++  getAliasDeletionJob,
++  getAliasPage,
++  getAllAliases,
++  getAllAccounts,
++  getLatestAliasDeletionJob,
++  startAliasDeletionJob,
++} from "../api/admin.js";
+ import { mergePoolPageSelection, poolAliasSelectable, submitPoolEnrollment } from "../utils/poolEnrollment.js";
+ import { useAuth } from "../stores/auth.js";
+ import SectionHeader from "../components/SectionHeader.vue";
+ import RequestAlert from "../components/RequestAlert.vue";
+ import { copyText } from "../utils/clipboard.js";
+ import { createCheckboxDragSelection } from "../utils/checkboxDragSelection.js";
++import {
++  ALIAS_DELETION_OPERATION_LABELS,
++  createAliasDeletionController,
++  createAliasDeletionStorage,
++  formatAliasDeletionResultMessage,
++  isAliasDeletionJobActive,
++  isAliasDeletionJobTerminal,
++} from "../utils/aliasDeletionJob.js";
++import { ADMIN_BASE_PATH } from "../utils/runtimePath.js";
++import { formatTime } from "../utils/format.js";
+ 
+ const auth = useAuth();
+ const tab = ref("members"),
+@@ -576,6 +689,11 @@ const memberState = ref(""),
+   projectName = ref("");
+ const memberPage = ref(1),
+   leasePage = ref(1);
++const poolDeleteLoading = ref(false),
++  poolDeleteConfirmOpen = ref(false),
++  poolDeleteConfirming = ref(false),
++  poolDeleteProgressOpen = ref(false),
++  poolDeletePreview = ref({ filters: [], total: 0, ids: [], items: [] });
+ const enrollOpen = ref(false),
+   enrollDraft = ref(""),
+   enrollSearch = ref(""),
+@@ -658,6 +776,69 @@ const query = (params) =>
+   ).toString();
+ const request = (path, method = "GET", body, signal) =>
+   apiRequest(path, { method, body, signal, csrfToken: auth.state.csrfToken });
++const poolDeletionState = ref({
++  job: null,
++  operationId: "",
++  recovering: true,
++  submitting: false,
++  cancelling: false,
++  checking: false,
++  uncertain: false,
++  error: null,
++  blocked: true,
++});
++let poolDeletionController;
++function makePoolDeletionController() {
++  const username = auth.state.username;
++  return createAliasDeletionController({
++    startJob: startAliasDeletionJob,
++    getJob: getAliasDeletionJob,
++    getLatestJob: getLatestAliasDeletionJob,
++    cancelJob: cancelAliasDeletionJob,
++    storage: createAliasDeletionStorage(ADMIN_BASE_PATH, username),
++    onChange(next) {
++      if (auth.state.username !== username) return;
++      poolDeletionState.value = next;
++      if (isAliasDeletionJobTerminal(next.job)) {
++        void loadMembers();
++      }
++    },
++  });
++}
++poolDeletionController = makePoolDeletionController();
++const poolDeletionJob = computed(() => poolDeletionState.value.job);
++const poolDeletionActive = computed(() =>
++  poolDeletionState.value.submitting || isAliasDeletionJobActive(poolDeletionJob.value),
++);
++const poolDeletionPercentage = computed(() => {
++  const job = poolDeletionJob.value;
++  return job?.requested ? Math.min(100, Math.max(0, job.processed / job.requested * 100)) : 0;
++});
++const poolDeletionRecentFailures = computed(() =>
++  (poolDeletionJob.value?.results || []).filter((item) => !item.deleted).slice(-5).reverse(),
++);
++const poolDeletionWaits = computed(() =>
++  poolDeletionJob.value?.status === "running" ? poolDeletionJob.value.waits || [] : [],
++);
++const poolDeletionJobType = computed(() => {
++  if (poolDeletionState.value.uncertain || poolDeletionWaits.value.length || poolDeletionJob.value?.failed || poolDeletionJob.value?.status === "interrupted") return "warning";
++  return poolDeletionJob.value?.status === "completed" ? "success" : "info";
++});
++const poolDeletionStatusLabel = computed(() => {
++  if (poolDeletionState.value.submitting) return "正在提交";
++  if (poolDeletionState.value.cancelling) return "正在取消";
++  if (poolDeletionState.value.uncertain) return "结果待确认";
++  if (poolDeletionState.value.recovering) return "恢复任务中";
++  if (poolDeletionWaits.value.length) return "执行中（Apple 限流等待）";
++  return { queued: "排队中", running: "执行中", completed: "已完成", interrupted: "已中断" }[poolDeletionJob.value?.status] || "查询中";
++});
++watch(() => auth.state.username, (username, previous) => {
++  if (!username || username === previous) return;
++  poolDeletionController.stop();
++  poolDeletionController = makePoolDeletionController();
++  poolDeletionState.value = poolDeletionController.getState();
++  void poolDeletionController.start();
++}, { flush: "sync" });
+ let poolRefreshTicket = 0;
+ let poolRefreshController;
+ let memberReadTicket = 0;
+@@ -687,6 +868,84 @@ async function loadMembers(signal) {
+     if (ticket === memberReadTicket) members.value = result;
+   });
+ }
++function poolDeleteFilterSummary() {
++  const account = mainAccounts.value.find((item) => String(item.id) === String(memberAccountId.value));
++  return [
++    { label: "用途", value: purposeName(memberPurpose.value) },
++    { label: "主号", value: account?.email || "全部主号" },
++    { label: "状态", value: memberState.value ? stateName(memberState.value) : "全部状态" },
++    { label: "搜索", value: search.value.trim() || "全部邮箱" },
++  ];
++}
++async function getAllFilteredPoolMembers() {
++  const items = [];
++  const snapshot = {
++    state: memberState.value,
++    purpose: memberPurpose.value,
++    account_id: memberAccountId.value,
++    q: search.value.trim(),
++  };
++  let offset = 0;
++  let total = 0;
++  do {
++    const result = await request("/pool/members?" + query({ ...snapshot, limit: 200, offset }));
++    const pageItems = Array.isArray(result?.items) ? result.items : [];
++    items.push(...pageItems);
++    total = Number(result?.total) || items.length;
++    offset += pageItems.length;
++    if (!pageItems.length) break;
++  } while (items.length < total);
++  return { items, total: items.length };
++}
++async function openPoolDeleteAction() {
++  if (poolDeletionActive.value) {
++    poolDeleteProgressOpen.value = true;
++    return;
++  }
++  if (poolDeleteLoading.value || poolDeleteConfirming.value || poolDeletionState.value.recovering || poolDeletionState.value.uncertain || poolDeletionState.value.cancelling) return;
++  poolDeleteLoading.value = true;
++  error.value = null;
++  try {
++    const result = await getAllFilteredPoolMembers();
++    if (!result.items.length) {
++      ElMessage.info("当前筛选没有匹配的邮箱");
++      return;
++    }
++    if (result.items.length > 1000) {
++      throw Object.assign(new Error("当前筛选超过单次 Apple 批量删除上限 1000 个，请缩小筛选范围后再操作。"), { code: "BATCH_DELETE_TOO_LARGE" });
++    }
++    poolDeletePreview.value = {
++      filters: poolDeleteFilterSummary(),
++      total: result.items.length,
++      ids: result.items.map((row) => row.alias_id),
++      items: result.items.slice(0, 50),
++    };
++    poolDeleteConfirmOpen.value = true;
++  } catch (e) {
++    if (e.name !== "AbortError") error.value = e;
++  } finally {
++    poolDeleteLoading.value = false;
++  }
++}
++async function submitPoolDelete() {
++  if (poolDeleteConfirming.value || !poolDeletePreview.value.ids.length) return;
++  poolDeleteConfirming.value = true;
++  poolDeleteConfirmOpen.value = false;
++  poolDeleteProgressOpen.value = true;
++  error.value = null;
++  try {
++    await poolDeletionController.submit(poolDeletePreview.value.ids, auth.state.csrfToken);
++  } catch (e) {
++    error.value = e;
++    poolDeleteProgressOpen.value = false;
++  } finally {
++    poolDeleteConfirming.value = false;
++  }
++}
++async function cancelPoolDelete() {
++  if (!isAliasDeletionJobActive(poolDeletionJob.value)) return;
++  await poolDeletionController.cancel(auth.state.csrfToken);
++}
+ async function loadLeases(signal) {
+   const ticket = ++leaseReadTicket;
+   await attempt(async () => {
+@@ -761,6 +1020,7 @@ onBeforeUnmount(() => {
+   ++memberReadTicket;
+   ++leaseReadTicket;
+   poolRefreshController?.abort();
++  poolDeletionController.stop();
+ });
+ async function mutate(fn) {
+   if (busy.value) return;
+@@ -1034,7 +1294,10 @@ const codeExample = computed(
+   () =>
+     `curl '${location.origin}/api/v1/pool/leases/LEASE_ID/code' \\\n  -H 'Authorization: Bearer PROJECT_KEY'`,
+ );
+-onMounted(() => refresh(true));
++onMounted(async () => {
++  await refresh(true);
++  if (auth.state.username) void poolDeletionController.start();
++});
+ </script>
+ 
+ <style scoped>
+@@ -1092,6 +1355,61 @@ onMounted(() => refresh(true));
+   color: var(--el-color-danger);
+ }
+ .pool-cooldown { color: var(--el-color-success); }
++.pool-delete-warning {
++  line-height: 1.8;
++  color: var(--el-color-danger);
++}
++.pool-delete-filters {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px 16px;
++  margin: 14px 0;
++  color: var(--el-text-color-secondary);
++}
++.pool-delete-filters strong {
++  color: var(--el-text-color-primary);
++}
++.pool-delete-count {
++  font-size: 18px;
++  font-weight: 600;
++  margin: 14px 0;
++}
++.pool-delete-preview {
++  max-height: 280px;
++  overflow: auto;
++  border: 1px solid var(--el-border-color-lighter);
++  border-radius: 6px;
++  padding: 8px 12px;
++}
++.pool-delete-preview__row,
++.pool-delete-waits,
++.pool-delete-failures {
++  display: grid;
++  gap: 4px;
++  line-height: 1.6;
++  margin: 4px 0;
++}
++.pool-delete-preview__row {
++  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.7fr);
++  gap: 12px;
++}
++.pool-delete-preview__row small {
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++.pool-delete-progress__header {
++  display: flex;
++  align-items: center;
++  flex-wrap: wrap;
++  gap: 10px;
++  margin-bottom: 12px;
++}
++.pool-delete-waits,
++.pool-delete-failures {
++  margin-top: 14px;
++  color: var(--el-text-color-secondary);
++}
+ .el-pagination {
+   margin-top: 20px;
+   overflow-x: auto;
+diff --git a/web/test/alias-deletion-job.test.js b/web/test/alias-deletion-job.test.js
+index e9309ea..03a68ce 100644
+--- a/web/test/alias-deletion-job.test.js
++++ b/web/test/alias-deletion-job.test.js
+@@ -328,6 +328,22 @@ test("result messages deduplicate retention notices and distinguish deferred and
+   assert.equal(formatAliasDeletionResultMessage({ deleted: true, message: "本地记录已保留" }), "已删除");
+ });
+ 
++test("cancellation requests the active job once and keeps its terminal snapshot", async () => {
++  const { controller, calls } = harness({
++    cancelJob: async (id, csrf) => {
++      calls.push(["CANCEL", id, csrf]);
++      return job("interrupted", { processed: 1, failed: 1, results: [{ id: 91, deleted: false, code: "BATCH_DELETE_INTERRUPTED" }] });
++    },
++  });
++  await controller.start();
++  await controller.submit([91], "csrf");
++  assert.equal(await controller.cancel("csrf"), true);
++  assert.deepEqual(calls.at(-1).slice(0, 3), ["CANCEL", operationId, "csrf"]);
++  assert.equal(controller.getState().job.status, "interrupted");
++  assert.equal(controller.getState().blocked, false);
++  controller.stop();
++});
++
+ test("lost submit responses query operationId even when latest has an unrelated completed job", async () => {
+   const calls = [];
+   const { controller, storage } = harness({

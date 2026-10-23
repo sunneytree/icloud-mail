@@ -91,7 +91,7 @@ var httpOperations = map[string]string{
 	"GET /accounts/:id/aliases/auto-create/keys": "读取新邮箱凭据", "DELETE /accounts/:id/aliases/auto-create/keys": "确认领取新邮箱凭据",
 	"POST /accounts/:id/aliases": "登记已有邮箱", "POST /accounts/:id/aliases/random": "生成自定义邮箱", "POST /accounts/:id/aliases/batch": "批量生成自定义邮箱", "POST /accounts/:id/aliases/generate": "生成自定义邮箱", "POST /accounts/:id/aliases/sync": "同步 Apple 隐私邮箱目录",
 	"GET /groups": "读取邮箱分组", "POST /groups": "创建邮箱分组", "PATCH /groups/:id": "重命名邮箱分组", "DELETE /groups/:id": "删除邮箱分组",
-	"PATCH /aliases/group": "批量移动邮箱分组", "PATCH /aliases/:id/group": "移动邮箱分组", "DELETE /aliases/batch": "提交 Apple 批量永久删除", "GET /aliases/batch/jobs/latest": "恢复最近批量删除任务", "GET /aliases/batch/jobs/:jobID": "读取批量删除进度",
+	"PATCH /aliases/group": "批量移动邮箱分组", "PATCH /aliases/:id/group": "移动邮箱分组", "DELETE /aliases/batch": "提交 Apple 批量永久删除", "GET /aliases/batch/jobs/latest": "恢复最近批量删除任务", "GET /aliases/batch/jobs/:jobID": "读取批量删除进度", "POST /aliases/batch/jobs/:jobID/cancel": "取消批量删除任务",
 	"POST /aliases/rotate-all-credentials": "轮换全部邮箱凭据", "POST /aliases/:id/rotate-key": "轮换单邮箱 API Key", "POST /aliases/:id/rotate-credentials": "轮换单邮箱完整凭据", "GET /audit": "读取管理操作记录",
 	"GET /pool/leases/:leaseID/code": "查询领取邮箱验证码", "POST /pool/leases/:leaseID/commit": "确认使用领取邮箱", "POST /pool/leases/:leaseID/release": "释放领取邮箱并轮换凭据", "POST /pool/leases/:leaseID/renew": "续期领取邮箱",
 	"POST /oauth2/v2.0/token": "换取 IMAP OAuth 访问凭据", "GET /docs": "查看 API 文档",

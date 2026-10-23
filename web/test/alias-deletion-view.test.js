@@ -132,7 +132,7 @@ test("each distinct account is checked once and a blocked recovery never opens c
   }
 });
 
-test("stale selection, Apple-directory pending, custom, errored and logged-out accounts stay blocked", async () => {
+test("stale selection, Apple-directory pending, custom and logged-out accounts stay blocked", async () => {
   const stale = harness({ selectedAliasIds: { value: [91, 99] } });
   await stale.run();
   assert.deepEqual(stale.events, ["clear"]);
@@ -143,8 +143,6 @@ test("stale selection, Apple-directory pending, custom, errored and logged-out a
   assert.equal(pending.warnings.length, 1);
   for (const detail of [
     { account: { mailboxType: "custom" } },
-    { account: { mailboxType: "icloud", lastSyncStatus: "error" } },
-    { account: { mailboxType: "icloud", lastSyncError: "sync error" } },
     { account: { mailboxType: "icloud" }, appleSession: { status: "expired" } },
   ]) {
     const blocked = harness({ getAccount: async () => detail });
@@ -152,6 +150,21 @@ test("stale selection, Apple-directory pending, custom, errored and logged-out a
     assert.deepEqual(blocked.events, ["stop", "begin", "restart"]);
     assert.equal(blocked.warnings.length, 1);
   }
+});
+
+test("sync errors do not block batch deletion when the Apple session is authenticated", async () => {
+  const view = harness({
+    getAccount: async () => ({
+      account: { mailboxType: "icloud", lastSyncStatus: "error", lastSyncError: "sync error" },
+      appleSession: { status: "authenticated" },
+    }),
+  });
+  await view.run();
+  assert.deepEqual(view.events, [
+    "stop", "begin", "confirm", "prompt", "submit", "clear", "restart",
+  ]);
+  assert.deepEqual(view.warnings, []);
+  assert.deepEqual(view.errors, []);
 });
 
 test("cancelling either dangerous confirmation never submits", async () => {

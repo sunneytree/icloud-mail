@@ -91,6 +91,7 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 | `DELETE /aliases/batch?async=1`，正文含 `alias_ids` 和 `operation_id` | `202 data {job_id,status,requested,processed,deleted,failed,results,request_id,created_at,updated_at}` | 提交后台任务，或取得幂等重试对应的原任务 |
 | `GET /aliases/batch/jobs/latest` | `200 data` 为任务对象或 `null` | 优先返回当前管理员的 active 任务，否则返回按创建时间最近的任务；没有任务时为 `null` |
 | `GET /aliases/batch/jobs/:jobID` | `200 data` 为任务对象 | 按 ID 轮询；ID 格式无效或当前管理员名下无该任务时返回 `404`，不泄露其他管理员的同 ID 任务 |
+| `POST /aliases/batch/jobs/:jobID/cancel` | `202 data` 为任务快照 | 请求协作取消 active 任务；当前 Apple 请求完成后停止后续邮箱，已发出的结果不回滚 |
 
 异步请求示例正文：
 

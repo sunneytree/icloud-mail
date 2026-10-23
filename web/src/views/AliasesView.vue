@@ -1255,12 +1255,7 @@ function batchDeleteAccountState(detail) {
   const mailboxType = String(account?.mailboxType || "")
     .trim()
     .toLowerCase();
-  const status = String(account?.lastSyncStatus || "")
-    .trim()
-    .toLowerCase();
-  const syncError = String(account?.lastSyncError || "").trim();
   if (mailboxType !== "icloud") return "custom";
-  if (status === "error" || syncError) return "error";
   if (detail?.appleSession?.status !== "authenticated") return "login";
   return "ok";
 }
@@ -1309,10 +1304,6 @@ async function deleteSelectedAliases() {
     const states = details.map(batchDeleteAccountState);
     if (states.includes("custom")) {
       ElMessage.warning("批量删除仅支持 Apple 已登录的 iCloud 主号。");
-      return;
-    }
-    if (states.includes("error")) {
-      ElMessage.warning("所选 iCloud 主号存在同步错误，请先处理错误后再批量删除。");
       return;
     }
     if (states.includes("login")) {

@@ -203,6 +203,49 @@ func TestAliasDeletionJobReturnsBeforeAppleAndSurvivesRequestCancellation(t *tes
 	}
 }
 
+func TestAliasDeletionJobCanBeCancelledByOwner(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	cookie, csrf, admin := env.createSession(t, "async-cancel-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "async-cancel@icloud.com")
+	first := adminAPITestCreateDeleteAlias(t, env, account.ID, "async-cancel-first@icloud.com")
+	second := adminAPITestCreateDeleteAlias(t, env, account.ID, "async-cancel-second@icloud.com")
+	startTestAliasDeletionJobs(t, env)
+	entered := make(chan struct{})
+	var calls atomic.Int32
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
+		},
+		deleteAliases: func(ctx context.Context, ids []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			calls.Add(1)
+			close(entered)
+			<-ctx.Done()
+			return []hmesync.AliasDeletionOutcome{{AliasID: ids[0], Err: ctx.Err()}}, ctx.Err()
+		},
+	})
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch?async=1", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{first.ID, second.ID}, "operation_id": "cancel-alias-delete-operation",
+	}), "application/json", []*http.Cookie{cookie}, csrf)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("admission = %d %s", response.Code, response.Body.String())
+	}
+	waitTestAliasDeletionSignal(t, entered)
+	cancel := env.request(t, http.MethodPost, "/admin/api/v1/aliases/batch/jobs/cancel-alias-delete-operation/cancel", nil, "", []*http.Cookie{cookie}, csrf)
+	if cancel.Code != http.StatusAccepted {
+		t.Fatalf("cancel = %d %s", cancel.Code, cancel.Body.String())
+	}
+	job := waitTestAliasDeletionJob(t, env, admin.ID, "cancel-alias-delete-operation")
+	if calls.Load() != 1 || job.Status != domain.AliasDeletionJobInterrupted || !job.Items[0].Done || job.Items[0].Code != "BATCH_DELETE_INTERRUPTED" || job.Items[1].Done {
+		t.Fatalf("cancelled job continued or published uncommitted work: calls=%d job=%#v", calls.Load(), job)
+	}
+	if _, err := env.store.GetAlias(context.Background(), first.ID); err != nil {
+		t.Fatalf("cancelled first alias was removed: %v", err)
+	}
+	if _, err := env.store.GetAlias(context.Background(), second.ID); err != nil {
+		t.Fatalf("cancelled second alias was removed: %v", err)
+	}
+}
+
 func TestAliasDeletionJobShutdownPersistsConfirmedResults(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	cookie, csrf, admin := env.createSession(t, "async-stop-admin", "unused-password")
